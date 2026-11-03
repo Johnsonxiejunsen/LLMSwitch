@@ -1,0 +1,13 @@
+{
+  "name": "claude-tools",
+  "owner": {
+    "name": "xiejunsen"
+  },
+  "plugins": [
+    {
+      "name": "context-keeper",
+      "source": "./context-keeper",
+      "description": "context 到 200k 自动压缩后忠实回注近期原文，落点≈150k"
+    }
+  ]
+}
