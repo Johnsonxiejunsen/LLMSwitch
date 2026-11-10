@@ -172,3 +172,78 @@ def aggregate_rows(rows: list[dict], prices: dict, *,
                               reverse=True),
             "skipped_unknown_models": skipped,
             "unknown_models": unknown}
+
+
+# ── SQL 源配置链(纯函数, 不连库) ──
+
+class SourceConfigError(Exception):
+    """SQL 源 column_map 违反必填规则((model+input+output) 或 cost 二选一)。"""
+
+_SKIP_REASONS = ("not_configured", "unreachable", "timeout",
+                 "auth_failed", "query_failed", "no_sources")
+
+
+def load_config() -> dict:
+    """~/.claude/llm-cost/config.json; 不存在返回 {}。"""
+    path = Path.home() / ".claude" / "llm-cost" / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"配置文件不可解析({path}): {e}") from e
+
+
+def resolve_secret(cfg: dict, plain_key: str = "password",
+                   env_key: str = "password_env") -> str | None:
+    """env 变量引用优先于明文; 都缺返回 None。"""
+    env_name = cfg.get(env_key)
+    if env_name:
+        import os
+        val = os.environ.get(str(env_name))
+        if val:
+            return val
+    plain = cfg.get(plain_key)
+    return str(plain) if plain else None
+
+
+def date_window(days: int, today) -> tuple:
+    """(start, end) = (今日−(days−1), 今日+1), 含首不含尾(DATETIME 安全, spec I1)。"""
+    from datetime import timedelta
+    days = max(1, int(days))
+    return today - timedelta(days=days - 1), today + timedelta(days=1)
+
+
+def substitute_placeholders(query: str, days: int, today) -> str:
+    """仅字面替换 {start_date}/{end_date}/{days} 三 token, 其余大括号原样(禁 str.format)。"""
+    start, end = date_window(days, today)
+    return (query.replace("{start_date}", start.isoformat())
+                 .replace("{end_date}", end.isoformat())
+                 .replace("{days}", str(days)))
+
+
+def transform_sql_rows(raw_rows: list[dict], column_map: dict,
+                       source_name: str) -> list[dict]:
+    """SQL 结果列 → 标准行; source 加 `源名:` 前缀; 必填规则校验(违者 SourceConfigError)。
+
+    column_map 键=标准列名, 值=SQL 列名; 未映射的标准列按同名列取, 取不到缺省。
+    """
+    mapping = dict(column_map or {})
+    rows: list[dict] = []
+    for raw in raw_rows:
+        row: dict = {}
+        for col in STANDARD_COLUMNS:
+            val = raw.get(mapping.get(col, col))
+            if val is not None:
+                row[col] = val
+        has_cost = "cost" in row
+        has_priced = all(k in row for k in ("model", "input_tokens", "output_tokens"))
+        if not (has_cost or has_priced):
+            raise SourceConfigError(
+                f"源 {source_name!r} column_map 违反必填规则: "
+                f"需 (model+input_tokens+output_tokens) 或 cost 二选一, 实得列 {sorted(row)}")
+        raw_src = row.get("source")
+        row["source"] = f"{source_name}:{raw_src}" if raw_src else source_name
+        rows.append(row)
+    return rows

@@ -157,5 +157,65 @@ class TestFileSource(unittest.TestCase):
         self.assertEqual(agg["skipped_unknown_models"], 0)
 
 
+class TestSqlConfigChain(unittest.TestCase):
+    def test_placeholder_boundaries(self):
+        from datetime import date
+        today = date(2026, 11, 10)
+        start, end = llm_cost.date_window(7, today)
+        self.assertEqual((start, end), (date(2026, 11, 4), date(2026, 11, 11)))
+        q = llm_cost.substitute_placeholders(
+            "SELECT ... WHERE d >= {start_date} AND d < {end_date} LIMIT {days}", 7, today)
+        self.assertEqual(q, "SELECT ... WHERE d >= 2026-11-04 AND d < 2026-11-11 LIMIT 7")
+
+    def test_literal_braces_preserved(self):
+        from datetime import date
+        today = date(2026, 11, 10)
+        q = llm_cost.substitute_placeholders(
+            "SELECT JSON_EXTRACT(c, '$.a') FROM t WHERE x = '{\"a\":1}' AND {unknown_var} AND {days}",
+            3, today)
+        # 仅三 token 被换, '{"a":1}' 与 {unknown_var} 原样(I7)
+        self.assertIn("'{\"a\":1}'", q)
+        self.assertIn("{unknown_var}", q)
+        self.assertNotIn("{start_date}", q)
+        self.assertTrue(q.endswith("AND 3"))
+
+    def test_transform_cost_passthrough(self):
+        raw = [{"d": "2026-11-10", "amt": "12.34"}]
+        rows = llm_cost.transform_sql_rows(
+            raw, {"day": "d", "cost": "amt"}, "prod")
+        self.assertEqual(rows[0]["cost"], "12.34")
+        self.assertEqual(rows[0]["source"], "prod")
+        self.assertEqual(rows[0]["day"], "2026-11-10")
+
+    def test_transform_model_path(self):
+        raw = [{"d": "2026-11-10", "m": "deepseek-v4-flash",
+                "ti": "1000000", "to": "500000", "src": "quote"}]
+        rows = llm_cost.transform_sql_rows(
+            raw, {"day": "d", "model": "m", "input_tokens": "ti",
+                  "output_tokens": "to", "source": "src"}, "prod")
+        self.assertEqual(rows[0]["model"], "deepseek-v4-flash")
+        self.assertEqual(rows[0]["source"], "prod:quote")
+
+    def test_transform_missing_both_raises(self):
+        raw = [{"d": "2026-11-10", "ti": "100"}]
+        with self.assertRaises(llm_cost.SourceConfigError):
+            llm_cost.transform_sql_rows(raw, {"day": "d", "input_tokens": "ti"}, "prod")
+
+    def test_password_env_priority(self):
+        import os
+        with patch.dict(os.environ, {"MY_DB_PW": "from-env"}):
+            self.assertEqual(
+                llm_cost.resolve_secret({"password": "plain", "password_env": "MY_DB_PW"}),
+                "from-env")
+        self.assertEqual(
+            llm_cost.resolve_secret({"password": "plain"}), "plain")
+        self.assertIsNone(llm_cost.resolve_secret({}))
+
+    def test_load_config_missing_returns_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(Path, "home", return_value=Path(td)):
+                self.assertEqual(llm_cost.load_config(), {})
+
+
 if __name__ == "__main__":
     unittest.main()
