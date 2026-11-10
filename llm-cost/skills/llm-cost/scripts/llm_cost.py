@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -326,3 +327,306 @@ def fetch_balance(cfg: dict, timeout: float = 5.0) -> dict | None:
                 "checked_at": datetime.now().isoformat(timespec="seconds")}
     except Exception:  # noqa: BLE001 —— 余额失败不影响主流程
         return None
+
+
+# ── CLI(calc / file / sql / balance / report) ──
+
+import argparse  # noqa: E402
+
+
+class _UsageError(Exception):
+    """argparse 用法错误 → main 返回 1(spec C2; argparse 默认 exit 2 会与"全源失败"混淆)。"""
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):  # pragma: no cover —— 由 test_argparse_usage_error_exit1 覆盖
+        raise _UsageError(message)
+
+
+def _add_file_opts(sp):
+    sp.add_argument("--format", choices=["jsonl", "csv"], default=None)
+    for col in ("day", "source", "model", "input-tokens", "output-tokens",
+                "cache-hit-tokens", "cost", "currency"):
+        sp.add_argument(f"--col-{col}", default=None)
+    sp.add_argument("--hit-included-in-input", action=argparse.BooleanOptionalAction,
+                    default=True)
+    sp.add_argument("--json", action="store_true")
+
+
+def _col_map_from_args(args) -> dict:
+    return {c.replace("-", "_"): v for c, v in vars(args).items()
+            if c.startswith("col_") and v is not None}
+
+
+def _fmt(d: Decimal, places: int = 4) -> str:
+    return f"{d:.{places}f}"
+
+
+def _merge_agg(base: dict, extra: dict) -> dict:
+    base["total"] += extra["total"]
+    for cur, v in extra["totals_by_currency"].items():
+        base["totals_by_currency"][cur] = base["totals_by_currency"].get(cur, Decimal(0)) + v
+    for row in extra["per_day"]:
+        key = (row["day"], row["source"], row["model"])
+        hit = next((r for r in base["per_day"]
+                    if (r["day"], r["source"], r["model"]) == key), None)
+        if hit:
+            hit["cost"] += row["cost"]
+        else:
+            base["per_day"].append(dict(row))
+    base["skipped_unknown_models"] += extra["skipped_unknown_models"]
+    base["unknown_models"] += extra["unknown_models"]
+    return base
+
+
+def _empty_agg() -> dict:
+    return {"total": Decimal(0), "totals_by_currency": {}, "per_day": [],
+            "skipped_unknown_models": 0, "unknown_models": []}
+
+
+def _cmd_calc(args) -> int:
+    prices = load_prices()
+    try:
+        key = normalize_model(args.model, prices)
+        cost = cost_from_tokens(key, args.input, args.output,
+                                cache_hit_tokens=args.cache_hit or 0,
+                                hit_included_in_input=args.hit_included_in_input,
+                                prices=prices)
+    except UnknownModelError:
+        known = ", ".join(sorted(prices["models"]))
+        print(f"[错误] 未知模型 {args.model!r}。可用: {known}; "
+              f"加新模型: ~/.claude/llm-cost/prices.json(本地覆盖, 见 SKILL.md)")
+        return 1
+    currency = prices["models"][key].get("currency", "CNY")
+    if args.json:
+        print(json.dumps({"model": key, "input_tokens": args.input,
+                          "output_tokens": args.output,
+                          "cache_hit_tokens": args.cache_hit or 0,
+                          "cost": _fmt(cost), "currency": currency},
+                         ensure_ascii=False))
+    else:
+        print(f"¥{_fmt(cost)} ({currency}, {key})")
+    return 0
+
+
+def _cmd_file(args) -> int:
+    try:
+        rows = parse_file_rows(args.path, fmt=args.format,
+                               col_map=_col_map_from_args(args))
+    except FileNotFoundError:
+        print(f"[错误] 文件不存在: {args.path}")
+        return 1
+    except ValueError as e:
+        print(f"[错误] {e}")
+        return 1
+    agg = aggregate_rows(rows, load_prices(),
+                         hit_included_in_input=args.hit_included_in_input)
+    if args.json:
+        print(json.dumps(agg, ensure_ascii=False, default=str))
+        return 0
+    print(f"合计: " + ", ".join(f"{cur} {v:.2f}"
+                                for cur, v in agg["totals_by_currency"].items()))
+    for r in agg["per_day"]:
+        model = r["model"] or "(未分模型)"
+        print(f"  {r['day'] or '-'}  {r['source'] or '-'}  {model}  {_fmt(r['cost'])}")
+    if agg["skipped_unknown_models"]:
+        names = ", ".join(agg["unknown_models"])
+        print(f"skipped_unknown_models={agg['skipped_unknown_models']} ({names})")
+    return 0
+
+
+def _cmd_sql(args) -> int:
+    config = load_config()
+    sources = config.get("sql_sources") or {}
+    cfg = sources.get(args.name)
+    if not cfg:
+        print(f"[skipped] sql 源 {args.name!r} 不存在(not_configured)")
+        return 1
+    from datetime import date
+    rows, reason = run_sql_source(args.name, cfg, args.days or 7, date.today())
+    if reason:
+        print(f"[skipped] sql 源 {args.name!r}: {reason}")
+        return 0 if reason != "not_configured" else 1
+    agg = aggregate_rows(rows, load_prices(),
+                         hit_included_in_input=bool(cfg.get("hit_included_in_input", True)))
+    print(json.dumps(agg, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_balance(args) -> int:
+    out = fetch_balance(load_config().get("deepseek") or {})
+    if out is None:
+        print("[skipped] DeepSeek 余额未配置 key 或查询失败")
+        return 0
+    parts = ", ".join(f"{cur} {v}" for cur, v in out["total_balance"].items())
+    print(f"余额: {parts}(is_available={out['is_available']}, "
+          f"账号级含其它服务消耗仅参考, checked_at={out['checked_at']})")
+    return 0
+
+
+def build_report(config: dict, days: int, source_spec: str = "auto",
+                 file_opts=None) -> dict:
+    """report 默认视图编排: 全部 SQL 源并列(sql:NAME 收窄)/file 源 + 余额。"""
+    from datetime import date
+    today = date.today()
+    agg = _empty_agg()
+    skipped: list[dict] = []
+    attempted = 0
+
+    if source_spec.startswith("file:"):
+        path = source_spec[len("file:"):]
+        attempted = 1
+        try:
+            fo = file_opts
+            rows = parse_file_rows(path, fmt=getattr(fo, "format", None),
+                                   col_map=_col_map_from_args(fo) if fo else {})
+            part = aggregate_rows(rows, load_prices(),
+                                  hit_included_in_input=getattr(
+                                      fo, "hit_included_in_input", True))
+            agg = _merge_agg(agg, part)
+        except (FileNotFoundError, ValueError):
+            skipped.append({"source": f"file:{path}", "reason": "not_configured"})
+    else:
+        sources = config.get("sql_sources") or {}
+        if source_spec == "auto":
+            selected = list(sources.items())
+        elif source_spec.startswith("sql:"):
+            name = source_spec[len("sql:"):]
+            selected = [(name, sources[name])] if name in sources else []
+            if not selected:
+                skipped.append({"source": f"sql:{name}", "reason": "not_configured"})
+                attempted = 1
+        else:
+            selected = []
+        for name, cfg in selected:
+            attempted += 1
+            rows, reason = run_sql_source(name, cfg, days, today)
+            if reason:
+                skipped.append({"source": f"sql:{name}", "reason": reason})
+                continue
+            part = aggregate_rows(
+                rows, load_prices(),
+                hit_included_in_input=bool(cfg.get("hit_included_in_input", True)))
+            agg = _merge_agg(agg, part)
+
+    succeeded = attempted - len(skipped)
+    today_str = str(today)
+    today_cost: dict[str, Decimal] = {}
+    for r in agg["per_day"]:
+        if r["day"] == today_str:
+            today_cost[r["currency"]] = today_cost.get(r["currency"], Decimal(0)) + r["cost"]
+    subtotals: dict[str, dict[str, Decimal]] = {}
+    for r in agg["per_day"]:
+        base = (r["source"] or "?").split(":")[0]
+        subtotals.setdefault(base, {})
+        subtotals[base][r["currency"]] = subtotals[base].get(r["currency"], Decimal(0)) + r["cost"]
+
+    return {"ok": attempted == 0 or succeeded > 0,
+            "days": days,
+            "attempted": attempted, "succeeded": succeeded,
+            "today": {"date": today_str,
+                      "cost_by_currency": {k: _fmt(v, 2) for k, v in today_cost.items()}},
+            "rows": agg["per_day"],
+            "totals": {k: _fmt(v, 2) for k, v in agg["totals_by_currency"].items()},
+            "subtotals_by_source": {s: {c: _fmt(v, 2) for c, v in cur.items()}
+                                    for s, cur in subtotals.items()},
+            "balance": fetch_balance(config.get("deepseek") or {}),
+            "skipped": skipped,
+            "skipped_unknown_models": agg["skipped_unknown_models"],
+            "unknown_models": agg["unknown_models"]}
+
+
+def render_report(report: dict) -> str:
+    lines: list[str] = []
+    if report["attempted"] == 0:
+        return ("未发现可用数据源。首次使用: 复制 config.template.json 到 "
+                "~/.claude/llm-cost/config.json 并填写(见 SKILL.md); "
+                "或直接 file/calc 算一笔\n")
+    today_parts = ", ".join(f"{cur} {v}" for cur, v in report["today"]["cost_by_currency"].items())
+    lines.append(f"今日({report['today']['date']}) LLM 成本: {today_parts or '¥0.00'}")
+    lines.append(f"近 {report['days']} 天(天×来源×模型):")
+    for r in sorted(report["rows"], key=lambda x: (x["day"] or "", x["source"] or ""),
+                    reverse=True):
+        lines.append(f"  {r['day'] or '-'}  {r['source'] or '-'}  "
+                     f"{r['model'] or '(未分模型)'}  {_fmt(r['cost'])}")
+    for src, cur_map in report["subtotals_by_source"].items():
+        parts = ", ".join(f"{cur} {v}" for cur, v in cur_map.items())
+        lines.append(f"  小计[{src}]: {parts}")
+    totals = ", ".join(f"{cur} {v}" for cur, v in report["totals"].items())
+    lines.append(f"合计: {totals or '¥0.00'}")
+    bal = report["balance"]
+    if bal:
+        parts = ", ".join(f"{cur} {v}" for cur, v in bal["total_balance"].items())
+        lines.append(f"余额: {parts}(账号级, 含其它服务消耗, 仅参考)")
+    for s in report["skipped"]:
+        lines.append(f"[skipped] {s['source']}: {s['reason']} → 已跳过, 其余照常")
+    if report["skipped_unknown_models"]:
+        lines.append(f"未知模型行已跳过 ×{report['skipped_unknown_models']}"
+                     f" ({', '.join(report['unknown_models'])})")
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_report(args) -> int:
+    config = load_config()
+    days = args.days
+    if days is None:
+        days = int((config.get("defaults") or {}).get("days", 7))
+    spec = args.source or "auto"
+    file_opts = args if spec.startswith("file:") else None
+    report = build_report(config, days, spec, file_opts)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, default=str))
+    else:
+        print(render_report(report), end="")
+    if report["attempted"] == 0:
+        return 0            # 未配置任何源: 引导而非失败(spec 判据⑩)
+    return 0 if report["succeeded"] > 0 else 2
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = _Parser(prog="llm_cost", description="通用 LLM 使用成本计算")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("calc", help="手报 token 数直算一笔")
+    sp.add_argument("--model", required=True)
+    sp.add_argument("--input", type=int, required=True)
+    sp.add_argument("--output", type=int, required=True)
+    sp.add_argument("--cache-hit", type=int, default=0)
+    sp.add_argument("--hit-included-in-input", action=argparse.BooleanOptionalAction,
+                    default=True)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=_cmd_calc)
+
+    sp = sub.add_parser("file", help="JSONL/CSV 用量文件汇总")
+    sp.add_argument("path")
+    _add_file_opts(sp)
+    sp.set_defaults(func=_cmd_file)
+
+    sp = sub.add_parser("sql", help="按本地配置跑命名 SQL 源")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--days", type=int, default=None)
+    sp.set_defaults(func=_cmd_sql)
+
+    sp = sub.add_parser("balance", help="DeepSeek 官方余额(需配置 key)")
+    sp.set_defaults(func=_cmd_balance)
+
+    sp = sub.add_parser("report", help="默认视图: 今日+近N天×来源+余额")
+    sp.add_argument("--days", type=int, default=None)
+    sp.add_argument("--source", default="auto",
+                    help="auto=全部 SQL 源并列 | sql:<名> | file:<路径>")
+    _add_file_opts(sp)
+    sp.set_defaults(func=_cmd_report)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = _build_parser().parse_args(argv)
+        return args.func(args)
+    except _UsageError as e:
+        print(f"[用法错误] {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -308,5 +308,113 @@ class TestFetchBalance(unittest.TestCase):
                 {"base_url": "https://x", "api_key": "sk-x"}))
 
 
+class TestCli(unittest.TestCase):
+    def _main(self, argv):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = llm_cost.main(argv)
+        return code, buf.getvalue()
+
+    def test_calc_exit0(self):
+        code, out = self._main(["calc", "--model", "deepseek-v4-flash",
+                                "--input", "1000000", "--output", "500000"])
+        self.assertEqual(code, 0)
+        self.assertIn("1.7000", out)  # spec 判据①: 展示 4 位小数
+
+    def test_calc_unknown_model_exit1(self):
+        code, out = self._main(["calc", "--model", "gpt-x",
+                                "--input", "10", "--output", "10"])
+        self.assertEqual(code, 1)
+        self.assertIn("未知模型", out)
+
+    def test_file_missing_exit1(self):
+        code, out = self._main(["file", "Z:/nope/missing.jsonl"])
+        self.assertEqual(code, 1)
+
+    def test_file_with_unknown_row_exit0(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "u.jsonl"
+            p.write_text('{"model": "gpt-x", "input_tokens": 1, "output_tokens": 1}\n',
+                         encoding="utf-8")
+            code, out = self._main(["file", str(p)])
+        self.assertEqual(code, 0)                     # 聚合中未知模型→跳过不失败(C2)
+        self.assertIn("skipped_unknown_models", out)
+        self.assertIn("gpt-x", out)
+
+    def test_argparse_usage_error_exit1(self):
+        self.assertEqual(self._main(["calc"])[0], 1)      # 缺必填参数
+        self.assertEqual(self._main([])[0], 1)            # 无子命令
+
+    def _cfg_with_sources(self, names):
+        return {"sql_sources": {n: {"driver": "mysql", "host": "h",
+                                     "database": "d", "query": "SELECT 1",
+                                     "column_map": {"cost": "c"}} for n in names}}
+
+    def test_report_all_sources_failed_exit2(self):
+        from unittest import mock
+        with mock.patch.object(llm_cost, "run_sql_source",
+                               return_value=(None, "unreachable")), \
+             mock.patch.object(llm_cost, "load_config",
+                               return_value=self._cfg_with_sources(["a", "b"])):
+            code, out = self._main(["report", "--json"])
+        self.assertEqual(code, 2)
+        payload = json.loads(out)
+        self.assertEqual(len(payload["skipped"]), 2)
+
+    def test_report_zero_cost_success_exit0(self):
+        from unittest import mock
+        with mock.patch.object(llm_cost, "run_sql_source",
+                               return_value=([], None)), \
+             mock.patch.object(llm_cost, "load_config",
+                               return_value=self._cfg_with_sources(["a"])):
+            code, out = self._main(["report", "--json"])
+        self.assertEqual(code, 0)                     # 成功源 0 行 = 没花钱 ≠ 全挂
+        payload = json.loads(out)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["rows"], [])
+
+    def test_report_json_keys(self):
+        from unittest import mock
+        with mock.patch.object(llm_cost, "run_sql_source",
+                               return_value=([], None)), \
+             mock.patch.object(llm_cost, "load_config",
+                               return_value=self._cfg_with_sources(["a"])), \
+             mock.patch.object(llm_cost, "fetch_balance", return_value=None):
+            code, out = self._main(["report", "--json"])
+        payload = json.loads(out)
+        for key in ("ok", "today", "rows", "totals", "balance", "skipped"):
+            self.assertIn(key, payload)               # --json 公开契约(I5)
+
+    def test_report_multisource_labels_and_subtotals(self):
+        from datetime import date
+        from unittest import mock
+
+        def fake_run(name, cfg, days, today):
+            rows = [{"day": str(date(2026, 11, 10)), "source": name,
+                     "model": None, "cost": "10.00" if name == "a" else "2.00",
+                     "currency": "CNY"}]
+            return rows, None
+
+        with mock.patch.object(llm_cost, "run_sql_source", side_effect=fake_run), \
+             mock.patch.object(llm_cost, "load_config",
+                               return_value=self._cfg_with_sources(["a", "b"])):
+            code, out = self._main(["report", "--json"])
+        payload = json.loads(out)
+        sources = {r["source"] for r in payload["rows"]}
+        self.assertEqual(sources, {"a", "b"})         # 行带源名(全源并列)
+        self.assertEqual(payload["subtotals_by_source"]["a"]["CNY"], "10.00")
+        self.assertEqual(payload["subtotals_by_source"]["b"]["CNY"], "2.00")
+
+    def test_report_no_sources_guidance_exit0(self):
+        from unittest import mock
+        with mock.patch.object(llm_cost, "load_config", return_value={}):
+            code, out = self._main(["report"])
+        self.assertEqual(code, 0)                     # 判据⑩: 不炸, 引导文案
+        self.assertIn("config.template", out)
+
+
 if __name__ == "__main__":
     unittest.main()
