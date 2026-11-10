@@ -100,5 +100,62 @@ class TestLoadPrices(unittest.TestCase):
         self.assertEqual(p["aliases"]["deepseek-chat"], "deepseek-v4-flash")
 
 
+class TestFileSource(unittest.TestCase):
+    def _tmp_file(self, content: str, suffix: str) -> Path:
+        import tempfile
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        p = Path(td.name) / f"usage{suffix}"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_jsonl_three_rows(self):
+        # 行1 带 cache_hit(flash 同价=1.70) / 行2 未知模型(跳过) / 行3 普通(0.056)
+        lines = [
+            '{"model": "deepseek-v4-flash", "input_tokens": 1000000, "output_tokens": 500000, "cache_hit_tokens": 400000}',
+            '{"model": "gpt-x", "input_tokens": 100, "output_tokens": 100}',
+            '{"model": "deepseek-v4-flash", "input_tokens": 200000, "output_tokens": 0}',
+        ]
+        path = self._tmp_file("\n".join(lines), ".jsonl")
+        rows = llm_cost.parse_file_rows(str(path))
+        self.assertEqual(len(rows), 3)
+        agg = llm_cost.aggregate_rows(rows, llm_cost.load_prices())
+        self.assertEqual(agg["total"], Decimal("1.756"))
+        self.assertEqual(agg["skipped_unknown_models"], 1)
+        self.assertEqual(agg["unknown_models"], ["gpt-x"])
+
+    def test_csv_column_override(self):
+        csv_text = ("prompt_tokens,completion_tokens,model\n"
+                    "1000000,500000,deepseek-v4-flash\n")
+        path = self._tmp_file(csv_text, ".csv")
+        rows = llm_cost.parse_file_rows(
+            str(path), col_map={"input_tokens": "prompt_tokens",
+                                "output_tokens": "completion_tokens"})
+        agg = llm_cost.aggregate_rows(rows, llm_cost.load_prices())
+        self.assertEqual(agg["total"], Decimal("1.70"))
+
+    def test_format_sniff_csv(self):
+        csv_text = ("input_tokens,output_tokens,model\n"
+                    "200000,0,deepseek-v4-flash\n")
+        path = self._tmp_file(csv_text, ".csv")  # 不传 fmt → 按扩展名走 csv
+        rows = llm_cost.parse_file_rows(str(path))
+        agg = llm_cost.aggregate_rows(rows, llm_cost.load_prices())
+        self.assertEqual(agg["total"], Decimal("0.056"))
+
+    def test_anthropic_rows_via_flag(self):
+        # input 不含 cache_read 的行 + 口径开关 → 1.14 对拍(C1)
+        rows = [{"model": "test-model", "input_tokens": 600_000,
+                 "output_tokens": 500_000, "cache_hit_tokens": 400_000}]
+        agg = llm_cost.aggregate_rows(rows, _prices_with_test_model(),
+                                      hit_included_in_input=False)
+        self.assertEqual(agg["total"], Decimal("1.14"))
+
+    def test_cost_passthrough_row(self):
+        rows = [{"model": None, "cost": Decimal("2.50"), "currency": "CNY"}]
+        agg = llm_cost.aggregate_rows(rows, llm_cost.load_prices())
+        self.assertEqual(agg["total"], Decimal("2.50"))
+        self.assertEqual(agg["skipped_unknown_models"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
