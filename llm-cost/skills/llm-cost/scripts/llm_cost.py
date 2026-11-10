@@ -247,3 +247,82 @@ def transform_sql_rows(raw_rows: list[dict], column_map: dict,
         row["source"] = f"{source_name}:{raw_src}" if raw_src else source_name
         rows.append(row)
     return rows
+
+
+# ── SQL 执行 + DeepSeek 余额(可连真实端; 超时=跳过不挂死) ──
+
+def _classify_connect_error(exc: Exception) -> str:
+    s = str(exc)
+    if "1045" in s or "access denied" in s.lower():
+        return "auth_failed"
+    if "timed out" in s.lower() or "timeout" in s.lower() or "2013" in s:
+        return "timeout"
+    return "unreachable"
+
+
+def run_sql_source(name: str, cfg: dict, days: int, today) -> tuple:
+    """跑一个命名 SQL 源 → (标准行, None) 或 (None, skip_reason)。
+
+    reason ∈ not_configured/unreachable/timeout/auth_failed/query_failed;
+    连接超时 5s / 读超时 10s(spec I8)。
+    """
+    try:
+        import pymysql
+    except ImportError:
+        print("[hint] SQL 源需要驱动: pip install pymysql")
+        return None, "not_configured"
+    if not cfg or cfg.get("driver", "mysql") != "mysql":
+        return None, "not_configured"
+    if not all(cfg.get(k) for k in ("host", "database", "query")):
+        return None, "not_configured"
+    password = resolve_secret(cfg)
+    q = substitute_placeholders(str(cfg["query"]), days, today)
+    try:
+        conn = pymysql.connect(
+            host=cfg["host"], port=int(cfg.get("port", 3306)),
+            user=cfg.get("user", ""), password=password,
+            database=cfg["database"], charset="utf8mb4",
+            connect_timeout=5, read_timeout=10,
+            cursorclass=pymysql.cursors.DictCursor)
+    except Exception as e:  # noqa: BLE001 —— 分类为跳过原因, 不挂死
+        return None, _classify_connect_error(e)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(q)
+            raw = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        return None, "query_failed"
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return transform_sql_rows([dict(r) for r in raw],
+                                  cfg.get("column_map") or {}, name), None
+    except SourceConfigError:
+        return None, "not_configured"
+
+
+def fetch_balance(cfg: dict, timeout: float = 5.0) -> dict | None:
+    """DeepSeek GET /user/balance(唯一账务接口); 无 key/失败返回 None(fail-open)。"""
+    import urllib.request
+    key = resolve_secret(cfg, plain_key="api_key", env_key="api_key_env")
+    if not key:
+        return None
+    base = str(cfg.get("base_url") or "https://api.deepseek.com").rstrip("/")
+    origin = base[:-3] if base.endswith("/v1") else base
+    try:
+        req = urllib.request.Request(
+            f"{origin}/user/balance",
+            headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read())
+        infos = {b.get("currency"): Decimal(str(b.get("total_balance", 0)))
+                 for b in d.get("balance_infos", [])}
+        from datetime import datetime
+        return {"is_available": d.get("is_available"),
+                "total_balance": infos,
+                "checked_at": datetime.now().isoformat(timespec="seconds")}
+    except Exception:  # noqa: BLE001 —— 余额失败不影响主流程
+        return None

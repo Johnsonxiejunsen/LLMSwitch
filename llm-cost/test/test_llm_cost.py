@@ -217,5 +217,96 @@ class TestSqlConfigChain(unittest.TestCase):
                 self.assertEqual(llm_cost.load_config(), {})
 
 
+class TestRunSqlSource(unittest.TestCase):
+    CFG = {"driver": "mysql", "host": "h", "port": 3306, "user": "u",
+           "database": "db", "query": "SELECT {days}",
+           "column_map": {"day": "d", "cost": "amt"}}
+
+    def _run(self, cfg, connect_exc=None, execute_exc=None, rows=None):
+        import sys as _sys
+        import types
+        from datetime import date
+        from unittest import mock
+        pymysql = mock.MagicMock()
+        mod = types.ModuleType("pymysql")
+        mod.connect = pymysql.connect
+        mod.cursors = mock.MagicMock()
+        conn = pymysql.connect.return_value          # 实现直接持有 conn, 不用 with
+        cursor = conn.cursor.return_value.__enter__.return_value
+        if connect_exc:
+            pymysql.connect.side_effect = connect_exc
+        if execute_exc:
+            cursor.execute.side_effect = execute_exc
+        if rows is not None:
+            cursor.fetchall.return_value = rows
+        with mock.patch.dict(_sys.modules, {"pymysql": mod}):
+            out = llm_cost.run_sql_source("s", cfg, 7, date(2026, 11, 10))
+        return out, pymysql
+
+    def test_run_sql_success(self):
+        rows = [{"d": "2026-11-10", "amt": "12.34"}]
+        (result, reason), pymysql = self._run(self.CFG, rows=rows)
+        self.assertIsNone(reason)
+        self.assertEqual(result[0]["cost"], "12.34")
+        self.assertEqual(result[0]["source"], "s")
+        pymysql.connect.assert_called_once()
+        # 超时参数随连接传入(I8)
+        kwargs = pymysql.connect.call_args.kwargs
+        self.assertEqual(kwargs.get("connect_timeout"), 5)
+        self.assertEqual(kwargs.get("read_timeout"), 10)
+
+    def test_run_sql_timeout_reason(self):
+        out, _ = self._run(self.CFG, connect_exc=Exception("(2013, 'timed out')"))
+        self.assertEqual(out, (None, "timeout"))
+
+    def test_run_sql_unreachable_and_auth(self):
+        out, _ = self._run(self.CFG, connect_exc=Exception("(2003, 'no route')"))
+        self.assertEqual(out, (None, "unreachable"))
+        out, _ = self._run(self.CFG, connect_exc=Exception("(1045, 'Access denied')"))
+        self.assertEqual(out, (None, "auth_failed"))
+
+    def test_run_sql_query_failed(self):
+        out, _ = self._run(self.CFG, execute_exc=Exception("bad sql"))
+        self.assertEqual(out, (None, "query_failed"))
+
+    def test_run_sql_config_error_reason(self):
+        cfg = dict(self.CFG, column_map={"day": "d"})  # 既无 model 组也无 cost
+        out, _ = self._run(cfg, rows=[{"d": "2026-11-10"}])
+        self.assertEqual(out, (None, "not_configured"))
+
+    def test_run_sql_missing_driver_or_host(self):
+        out, _ = self._run({"query": "SELECT 1"}, rows=[])
+        self.assertEqual(out, (None, "not_configured"))
+
+
+class TestFetchBalance(unittest.TestCase):
+    def test_balance_no_key_none(self):
+        self.assertIsNone(llm_cost.fetch_balance({}))
+        self.assertIsNone(llm_cost.fetch_balance({"base_url": "https://x"}))
+
+    def test_balance_mock_200(self):
+        import io
+        from unittest.mock import patch
+        payload = {"is_available": True, "balance_infos": [
+            {"currency": "CNY", "total_balance": "88.50"}]}
+        resp = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        resp.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+        with patch("urllib.request.urlopen", return_value=resp) as ur:
+            out = llm_cost.fetch_balance(
+                {"base_url": "https://api.deepseek.com", "api_key": "sk-x"})
+        self.assertEqual(out["is_available"], True)
+        self.assertEqual(out["total_balance"], {"CNY": 88.50})
+        self.assertIn("checked_at", out)
+        req = ur.call_args[0][0]
+        self.assertTrue(str(req.full_url).endswith("/user/balance"))
+        self.assertEqual(req.headers.get("Authorization"), "Bearer sk-x")
+
+    def test_balance_failure_none(self):
+        from unittest.mock import patch
+        with patch("urllib.request.urlopen", side_effect=OSError("boom")):
+            self.assertIsNone(llm_cost.fetch_balance(
+                {"base_url": "https://x", "api_key": "sk-x"}))
+
+
 if __name__ == "__main__":
     unittest.main()
