@@ -180,7 +180,7 @@ cost(model, input_tokens, output_tokens, cache_hit_tokens=0) -> Decimal
 | 通用 | `--json` | 机读输出, 骨架见下方 --json 契约 |
 
 - `--source auto`(**评审定稿·用户拍板"全部并列"**): 遍历配置里**全部** SQL 源并列汇总,
-  行标签 `源名:来源列`(如 `prod:quote_agent`), 各源独立小计;
+  行标签 `源名:来源列`(如 `prod:chat`), 各源独立小计;
   **跳过原因枚举**(I3): `not_configured`(显式 `sql:<名>` 不存在)/`unreachable`/`timeout`/`auth_failed`/`query_failed`/`no_sources`
 - **report 表行键 = 天×来源×模型**(M9): model 列缺失的直通行标 `(未分模型)`
 - **多币种**(M3): 按 `currency` 分组小计与合计, 不折算; `cost` 直通列缺币种信息时默认 CNY
