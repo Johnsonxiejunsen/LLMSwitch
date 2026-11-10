@@ -8,6 +8,11 @@
       "name": "context-keeper",
       "source": "./context-keeper",
       "description": "context 到 200k 自动压缩后忠实回注近期原文，落点≈150k"
+    },
+    {
+      "name": "llm-cost",
+      "source": "./llm-cost",
+      "description": "通用 LLM 使用成本计算: 单价注册表×token 分档, 手报/文件/SQL/余额四源"
     }
   ]
 }
