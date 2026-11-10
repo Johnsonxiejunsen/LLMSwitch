@@ -428,5 +428,108 @@ class TestCli(unittest.TestCase):
         self.assertIn("config.template", out)
 
 
+class TestReviewFixPass(unittest.TestCase):
+    """终审修复波(1C+4I): 每测对应评审发现, 先 RED 后 GREEN。"""
+
+    def _main(self, argv):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = llm_cost.main(argv)
+        return code, buf.getvalue()
+
+    def test_f1_cli_col_flags_end_to_end(self):
+        # Critical#1: --col-* 旗标经 CLI 端到端生效(此前键带 col_ 前缀全被忽略→静默¥0)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "u.csv"
+            p.write_text("d,m,tok_in,tok_out\n2026-11-10,deepseek-v4-flash,1000000,500000\n",
+                         encoding="utf-8")
+            code, out = self._main(["file", str(p), "--format", "csv", "--col-day", "d",
+                                    "--col-model", "m", "--col-input-tokens", "tok_in",
+                                    "--col-output-tokens", "tok_out"])
+        self.assertEqual(code, 0)
+        self.assertIn("1.70", out)
+
+    def test_f2_hit_flag_documented_false_form(self):
+        # Important#2: spec 文档形态 --hit-included-in-input false / =false 可用
+        import tempfile
+        row = ('{"model": "test-model", "input_tokens": 600000, '
+               '"output_tokens": 500000, "cache_hit_tokens": 400000}\n')
+        local = {"models": {"test-model": {"hit": 0.1, "miss": 1.0, "out": 1.0,
+                                           "currency": "CNY"}}}
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            cfg_dir = home / ".claude" / "llm-cost"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "prices.json").write_text(json.dumps(local), encoding="utf-8")
+            p = home / "u.jsonl"
+            p.write_text(row, encoding="utf-8")
+            with patch.object(Path, "home", return_value=home):
+                code, out = self._main(["file", str(p),
+                                        "--hit-included-in-input", "false"])
+                code2, out2 = self._main(["file", str(p),
+                                          "--hit-included-in-input=false"])
+        self.assertEqual(code, 0)
+        self.assertIn("1.14", out)                     # 0.04+0.6+0.5 (C1 对拍)
+        self.assertEqual(code2, 0)
+        self.assertIn("1.14", out2)
+
+    def test_f3_cache_miss_inconsistency_all_miss(self):
+        # Important#3: hit+miss≠input 不自洽 → 全记 miss(C1, 不虚构命中)
+        rows = [{"model": "test-model", "input_tokens": 1_000_000,
+                 "output_tokens": 0, "cache_hit_tokens": 400_000,
+                 "cache_miss_tokens": 600_000},            # 自洽: 400+600==1000k
+                {"model": "test-model", "input_tokens": 1_000_000,
+                 "output_tokens": 0, "cache_hit_tokens": 800_000,
+                 "cache_miss_tokens": 600_000}]            # 不自洽: 800+600≠1000k
+        agg = llm_cost.aggregate_rows(rows, _prices_with_test_model())
+        # 行1 自洽 0.04+0.6=0.64; 行2 全 miss 1.0 → 1.64 (未实现时 1.32)
+        self.assertEqual(agg["total"], Decimal("1.64"))
+
+    def test_f3b_col_cache_miss_flag_exists(self):
+        # Important#3 附: --col-cache-miss-tokens 旗标存在(标准列第9列)
+        code, out = self._main(["file", "Z:/nope.jsonl",
+                                "--col-cache-miss-tokens", "cm"])
+        self.assertNotIn("unrecognized arguments", out)
+        self.assertEqual(code, 1)                      # 到达的应是"文件不存在"
+
+    def test_f4_sql_days_config_precedence(self):
+        # Important#4: sql 子命令 --days 同守 I6 优先级(CLI>config defaults>7)
+        from datetime import date
+        from unittest import mock
+        seen = {}
+
+        def fake_run(name, cfg, days, today):
+            seen["days"] = days
+            return [], None
+
+        cfg = {"defaults": {"days": 30},
+               "sql_sources": {"prod": {"driver": "mysql", "host": "h",
+                                        "database": "d", "query": "SELECT 1",
+                                        "column_map": {"cost": "c"}}}}
+        with mock.patch.object(llm_cost, "run_sql_source", side_effect=fake_run), \
+             mock.patch.object(llm_cost, "load_config", return_value=cfg):
+            code, _ = self._main(["sql", "--name", "prod"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["days"], 30)             # 非 7
+
+    def test_f5_corrupt_local_prices_clean_error(self):
+        # Important#5: 本地 prices.json 损坏 → 明错 exit 1(不静默回退仓内价)
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            cfg_dir = home / ".claude" / "llm-cost"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "prices.json").write_text('{"models": {,}}', encoding="utf-8")
+            with patch.object(Path, "home", return_value=home):
+                code, out = self._main(["calc", "--model", "deepseek-v4-flash",
+                                        "--input", "1000000", "--output", "500000"])
+        self.assertEqual(code, 1)
+        self.assertIn("[错误]", out)
+        self.assertIn("prices.json", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,10 @@ def load_prices() -> dict:
         try:
             with open(local_path, encoding="utf-8") as f:
                 local = json.load(f, parse_float=Decimal)
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError as e:   # 损坏≠不存在: 静默回退会让校准价变仓内价(Important#5)
+            raise ValueError(
+                f"本地价格文件不可解析: {local_path}({e}) —— 修正或删除后重试") from e
+        except OSError:
             local = {}
         prices["models"] = {**prices.get("models", {}), **local.get("models", {})}
         prices["aliases"] = {**prices.get("aliases", {}), **local.get("aliases", {})}
@@ -159,9 +162,16 @@ def aggregate_rows(rows: list[dict], prices: dict, *,
             skipped += 1
             unknown.append(str(model))
             continue
+        hit_tok = int(r.get("cache_hit_tokens") or 0)
+        in_tok = int(r.get("input_tokens") or 0)
+        # C1 自洽校验(默认口径): 提供 cache_miss 列且 hit+miss≠input → 全记 miss, 不虚构命中
+        miss_tok = r.get("cache_miss_tokens")
+        if (hit_included_in_input and miss_tok is not None
+                and hit_tok + int(miss_tok) != in_tok):
+            hit_tok = 0
         c = cost_from_tokens(
-            key, int(r.get("input_tokens") or 0), int(r.get("output_tokens") or 0),
-            int(r.get("cache_hit_tokens") or 0),
+            key, in_tok, int(r.get("output_tokens") or 0),
+            hit_tok,
             hit_included_in_input=hit_included_in_input, prices=prices)
         _add(r.get("day"), r.get("source"), key, c,
              str(prices["models"][key].get("currency") or "CNY"))
@@ -343,18 +353,31 @@ class _Parser(argparse.ArgumentParser):
         raise _UsageError(message)
 
 
+def _parse_hit_flag(v):
+    """--hit-included-in-input 取值: true/false/1/0/yes/no(裸旗标=const True)。"""
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "y"):
+        return True
+    if s in ("false", "0", "no", "n"):
+        return False
+    raise _UsageError(f"--hit-included-in-input 需 true/false, 收到 {v!r}")
+
+
 def _add_file_opts(sp):
     sp.add_argument("--format", choices=["jsonl", "csv"], default=None)
     for col in ("day", "source", "model", "input-tokens", "output-tokens",
-                "cache-hit-tokens", "cost", "currency"):
+                "cache-hit-tokens", "cache-miss-tokens", "cost", "currency"):
         sp.add_argument(f"--col-{col}", default=None)
-    sp.add_argument("--hit-included-in-input", action=argparse.BooleanOptionalAction,
-                    default=True)
+    sp.add_argument("--hit-included-in-input", nargs="?", const=True, default=True,
+                    type=_parse_hit_flag)
     sp.add_argument("--json", action="store_true")
 
 
 def _col_map_from_args(args) -> dict:
-    return {c.replace("-", "_"): v for c, v in vars(args).items()
+    # dest 形如 col_day/col_input_tokens → 剥 col_ 前缀得标准列名(Critical#1)
+    return {c[len("col_"):]: v for c, v in vars(args).items()
             if c.startswith("col_") and v is not None}
 
 
@@ -443,7 +466,11 @@ def _cmd_sql(args) -> int:
         print(f"[skipped] sql 源 {args.name!r} 不存在(not_configured)")
         return 1
     from datetime import date
-    rows, reason = run_sql_source(args.name, cfg, args.days or 7, date.today())
+    rows, reason = run_sql_source(
+        args.name, cfg,
+        args.days if args.days is not None
+        else int((config.get("defaults") or {}).get("days", 7)),  # I6: CLI>config>7
+        date.today())
     if reason:
         print(f"[skipped] sql 源 {args.name!r}: {reason}")
         return 0 if reason != "not_configured" else 1
@@ -592,8 +619,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--input", type=int, required=True)
     sp.add_argument("--output", type=int, required=True)
     sp.add_argument("--cache-hit", type=int, default=0)
-    sp.add_argument("--hit-included-in-input", action=argparse.BooleanOptionalAction,
-                    default=True)
+    sp.add_argument("--hit-included-in-input", nargs="?", const=True, default=True,
+                    type=_parse_hit_flag)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=_cmd_calc)
 
@@ -638,6 +665,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except _UsageError as e:
         print(f"[用法错误] {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:   # 配置不可解析/脏数据格式错 → 明错而非回溯(C2: 业务错=1)
+        print(f"[错误] {e}")
         return 1
 
 
