@@ -348,6 +348,18 @@ class TestCli(unittest.TestCase):
         self.assertEqual(self._main(["calc"])[0], 1)      # 缺必填参数
         self.assertEqual(self._main([])[0], 1)            # 无子命令
 
+    def test_piped_gbk_console_never_crashes(self):
+        # Windows GBK 管道下 ¥(U+00A5) 不可编码——脚本经管道跑(Claude/CI)不得崩
+        import subprocess
+        import sys as _sys
+        r = subprocess.run(
+            [_sys.executable, str(SCRIPTS_DIR / "llm_cost.py"), "calc",
+             "--model", "deepseek-v4-flash", "--input", "1000000",
+             "--output", "500000"],
+            capture_output=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("1.7000", r.stdout.decode("utf-8", "replace"))
+
     def _cfg_with_sources(self, names):
         return {"sql_sources": {n: {"driver": "mysql", "host": "h",
                                      "database": "d", "query": "SELECT 1",

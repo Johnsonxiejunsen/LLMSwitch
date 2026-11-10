@@ -619,7 +619,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _harden_streams():
+    """Windows GBK 管道下 ¥(U+00A5) 不可编码会崩 — 统一 utf-8(errors=replace)。
+
+    真控制台走 WriteConsoleW 不受影响; 管道消费方(Claude/CI)按 utf-8 读, 中文也正。
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # StringIO(测试)/已关流
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _harden_streams()
     try:
         args = _build_parser().parse_args(argv)
         return args.func(args)
