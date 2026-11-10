@@ -1,0 +1,5 @@
+{
+  "name": "llm-cost",
+  "version": "0.1.0",
+  "description": "通用 LLM 使用成本计算: 单价注册表×token 分档, 手报/文件/SQL/余额四源"
+}

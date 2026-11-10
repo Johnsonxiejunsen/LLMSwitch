@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "models": {
+    "deepseek-v4-flash": {
+      "hit": 0.28,
+      "miss": 0.28,
+      "out": 2.84,
+      "currency": "CNY",
+      "unit": "per_M_tokens",
+      "effective_from": "2026-09-10",
+      "source": "控制台按key用量×token拟合校准(价格页读数虚高已弃用)",
+      "note": "hit 零观测按 miss 保守计"
+    },
+    "deepseek-v4-pro": {
+      "hit": 0.84,
+      "miss": 0.84,
+      "out": 8.52,
+      "currency": "CNY",
+      "unit": "per_M_tokens",
+      "effective_from": "2026-11-10",
+      "source": "flash×3 占位, 未校准 —— 使用前请自行校准并更新本行"
+    }
+  },
+  "aliases": {
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-flash"
+  },
+  "aliases_note": "chat/reasoner 为官方弃用别名, 均按 v4-flash 校准价计(不另设单价)"
+}
