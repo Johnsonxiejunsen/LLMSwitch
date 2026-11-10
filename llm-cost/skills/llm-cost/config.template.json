@@ -1,0 +1,21 @@
+{
+  "defaults": { "days": 7 },
+  "sql_sources": {
+    "<源名>": {
+      "driver": "mysql",
+      "host": "<HOST>", "port": 3306, "user": "<USER>",
+      "password": "<明文或省略>", "password_env": "<环境变量名(优先于明文)>",
+      "database": "<DB>",
+      "query": "<你自己的聚合 SQL; 可用占位符 {start_date}/{end_date}/{days} 由脚本按 --days 本地时区替换, 不写=自包含>",
+      "column_map": {
+        "day": "day列名(可省=不按天分组)", "source": "source列名(可省)",
+        "model": "model列名(与 cost 二选一)", "input_tokens": "...", "output_tokens": "...",
+        "cache_hit_tokens": "(可省)", "cache_miss_tokens": "(可省, 供自洽校验)",
+        "cost": "金额列名(与 model 二选一: 有=直通库内已算金额, 跳过计价)",
+        "currency": "(可省, 直通行币种, 缺省 CNY)"
+      },
+      "hit_included_in_input": true
+    }
+  },
+  "deepseek": { "base_url": "https://api.deepseek.com", "api_key": "<sk-...>", "api_key_env": "<环境变量名(优先于明文)>" }
+}
