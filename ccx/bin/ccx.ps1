@@ -6,9 +6,10 @@ Import-Module (Join-Path $PSScriptRoot 'ccx-core.psm1') -Force
 function Show-CcxUsage {
     Write-Output 'ccx — Claude Code 号池启动器'
     Write-Output '用法:'
-    Write-Output '  ccx                       交互选模型并启动（尚未接入）'
-    Write-Output '  ccx -c | ccx -r           续会话重新选号（尚未接入）'
-    Write-Output '  ccx <model>[@<id>]        直启模型/强指号（尚未接入）'
+    Write-Output '  ccx                       交互选模型并启动'
+    Write-Output '  ccx -c | ccx -r           续会话，重新自动选号'
+    Write-Output '  ccx <model>[@<id>]        直启模型 / 强指号'
+    Write-Output '  ccx <model> ... --no-check            跳过启动预检'
     Write-Output '  ccx list                  池状态面板 + 快照漂移提示'
     Write-Output '  ccx mark <id> <r429|daily|blocked>   标记受限'
     Write-Output '  ccx unlock <id>           解锁 blocked'
@@ -20,8 +21,7 @@ function Show-CcxUsage {
 try {
     if ($args.Count -eq 0) { Show-CcxUsage; exit 1 }
     $cmd = [string]$args[0]
-    switch ($cmd) {
-        'list' { Invoke-CcxList | Write-Output }
+    switch ($cmd) {        'list' { Invoke-CcxList | Write-Output }
         'mark' {
             if ($args.Count -lt 3) { throw '用法: ccx mark <id> <r429|daily|blocked>' }
             Invoke-CcxMark -Id ([string]$args[1]) -Status ([string]$args[2])
@@ -51,9 +51,17 @@ try {
             }
         }
         default {
-            Write-Output ('未知命令: ' + $cmd)
-            Show-CcxUsage
-            exit 1
+            # 启动路径：首个非 - 开头参数=模型别名(可 @id 强指)，其余透传 claude；--no-check 剥离
+            $modelSpec = ''
+            $noCheck = $false
+            $passthrough = @()
+            foreach ($a in $args) {
+                $s = [string]$a
+                if ($s -eq '--no-check') { $noCheck = $true; continue }
+                if (-not $modelSpec -and $s -notlike '-*') { $modelSpec = $s; continue }
+                $passthrough += $s
+            }
+            Invoke-CcxLaunch -ModelSpec $modelSpec -Passthrough $passthrough -NoCheck:$noCheck
         }
     }
 } catch {

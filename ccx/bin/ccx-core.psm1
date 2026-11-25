@@ -409,6 +409,9 @@ function Merge-CcxEnv {
     if ($Account['env'] -is [hashtable]) {
         foreach ($k in @($Account['env'].Keys)) { $merged[$k] = $Account['env'][$k] }
     }
+    # spec §4：base_url/auth_token 是账号顶层字段，必须注入对应 env 键（P2/P3 实证 --settings 可覆盖）
+    if ($Account['base_url']) { $merged['ANTHROPIC_BASE_URL'] = [string]$Account['base_url'] }
+    if ($Account['auth_token']) { $merged['ANTHROPIC_AUTH_TOKEN'] = [string]$Account['auth_token'] }
     $merged['CCX_ACCOUNT_ID'] = [string]$Account['id']
     $merged['CCX_ACCOUNT_LABEL'] = [string]$Account['label']
     return $merged
@@ -603,4 +606,98 @@ function Invoke-CcxSetDefault {
     $reg['default_account'] = $Id
     Save-CcxJson -Path (Join-Path (Get-CcxHome) 'registry.json') -Data $reg
     Write-Output ('默认号已设为 ' + $Id + '，settings.json 已同步（备份: ' + (Split-Path $bak -Leaf) + '）')
+}
+
+function Get-CcxVendorGroup {
+    # 按 vendor 直接建组（-p 非交互取 default 组 / 交互菜单用）
+    param([Parameter(Mandatory = $true)][hashtable]$Registry, [Parameter(Mandatory = $true)][string]$Vendor)
+    $accounts = @($Registry['accounts'] | Where-Object { $_ -and $_['enabled'] -ne $false -and $_['vendor'] -eq $Vendor })
+    if ($accounts.Count -eq 0) { return $null }
+    $label = $Vendor
+    if ($Registry['models'] -is [hashtable]) {
+        foreach ($k in @($Registry['models'].Keys)) {
+            if ($Registry['models'][$k]['vendor'] -eq $Vendor) { $label = $Registry['models'][$k]['label']; break }
+        }
+    }
+    return @{ Vendor = $Vendor; Label = $label; Accounts = $accounts }
+}
+
+function Invoke-CcxLaunch {
+    # 启动路径：模型解析（-p 绝不 Read-Host）→ 选号+预检接力 → 临时 settings → claude 透传 → finally 清理
+    # 失败模板：号池不可用(<原因>)。裸 claude 不受影响，仍可用 settings.json 快照号。
+    param([string]$ModelSpec, [string[]]$Passthrough = @(), [switch]$NoCheck, [scriptblock]$Probe)
+
+    $reg = $null
+    try { $reg = Read-CcxRegistry } catch {
+        throw ('号池不可用(registry.json 损坏: ' + $_.Exception.Message + ')。裸 claude 不受影响，仍可用 settings.json 快照号。')
+    }
+    if ($null -eq $reg) { throw '号池不可用(registry.json 不存在，先 ccx add)。裸 claude 不受影响，仍可用 settings.json 快照号。' }
+    if (-not $reg['accounts'] -or @($reg['accounts']).Count -eq 0) { throw '号池不可用(号池为空，先 ccx add)。裸 claude 不受影响，仍可用 settings.json 快照号。' }
+
+    $strongId = $null
+    if ($ModelSpec.Contains('@')) { $strongId = ($ModelSpec -split '@')[1] }
+
+    $grp = $null
+    if ($ModelSpec) {
+        $grp = Resolve-CcxModelGroup -ModelSpec $ModelSpec -Registry $reg
+        if ($null -eq $grp) {
+            if ($strongId -and @($reg['accounts'] | Where-Object { $_['id'] -eq $strongId }).Count -eq 0) {
+                throw ('强指号不存在: ' + $strongId)
+            }
+            $aliases = ''
+            if ($reg['models'] -is [hashtable]) { $aliases = (@($reg['models'].Keys) -join ', ') }
+            throw ('未知模型: ' + $ModelSpec + '（可用: ' + $aliases + '）')
+        }
+    } else {
+        $grp = Resolve-CcxModelGroup -ModelSpec '' -Registry $reg
+        if ($null -eq $grp) {
+            # 多 vendor：-p/--print 非交互 → default_account 组（无 default 取第一组），绝不 Read-Host
+            $nonInteractive = (@($Passthrough) -contains '-p') -or (@($Passthrough) -contains '--print')
+            if ($nonInteractive) {
+                $vendor = $null
+                if ($reg['default_account']) {
+                    $def = @($reg['accounts'] | Where-Object { $_['id'] -eq $reg['default_account'] } | Select-Object -First 1)
+                    if ($def.Count -gt 0) { $vendor = $def[0]['vendor'] }
+                }
+                if (-not $vendor) { $vendor = @($reg['accounts'])[0]['vendor'] }
+                $grp = Get-CcxVendorGroup -Registry $reg -Vendor $vendor
+            } else {
+                $vendors = @($reg['accounts'] | ForEach-Object { $_['vendor'] } | Select-Object -Unique)
+                Write-Output '选择模型组:'
+                for ($i = 0; $i -lt $vendors.Count; $i++) {
+                    $g = Get-CcxVendorGroup -Registry $reg -Vendor $vendors[$i]
+                    Write-Output ('  ' + ($i + 1) + '. ' + $g['Label'] + '（' + $vendors[$i] + '，' + @($g['Accounts']).Count + ' 个号）')
+                }
+                $choice = Read-Host '输入编号'
+                $n = 0
+                if (-not [int]::TryParse([string]$choice, [ref]$n) -or $n -lt 1 -or $n -gt $vendors.Count) { throw ('无效选择: ' + $choice) }
+                $grp = Get-CcxVendorGroup -Registry $reg -Vendor $vendors[$n - 1]
+            }
+        }
+    }
+
+    $state = Read-CcxState
+    $r = Select-AndPreflight -Registry $reg -State $state -Group $grp -NoCheck:$NoCheck -StrongId $strongId -Probe $Probe
+    foreach ($w in @($r['Warnings'])) { Write-Output ('⚠ ' + $w) }
+    if ($null -eq $r['Account']) {
+        Write-Output $r['Panel']
+        exit 1
+    }
+    $acc = $r['Account']
+    $passthroughTxt = ''
+    if (@($Passthrough).Count -gt 0) { $passthroughTxt = ' ' + (@($Passthrough) -join ' ') }
+    Write-Output ('ccx: 启动 ' + $acc['label'] + '（' + $acc['id'] + '）' + $passthroughTxt)
+
+    $env2 = Merge-CcxEnv -Account $acc
+    $tmp = Write-CcxTempSettings -Env $env2
+    $claudeCmd = 'claude'
+    if ($env:CCX_CLAUDE_CMD) { $claudeCmd = $env:CCX_CLAUDE_CMD }
+    $argList = @('--settings', $tmp) + @($Passthrough)
+    $global:LASTEXITCODE = 0
+    try {
+        & $claudeCmd @argList
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    } finally {
+        Remove-CcxTempSettings -Path $tmp
+    }
 }

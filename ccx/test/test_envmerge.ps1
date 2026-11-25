@@ -32,6 +32,12 @@ try {
     Assert-Equal 'glm-1' $m['CCX_ACCOUNT_ID'] 'CCX_ACCOUNT_ID 注入'
     Assert-Equal '智谱1' $m['CCX_ACCOUNT_LABEL'] 'CCX_ACCOUNT_LABEL 注入'
 
+    # 顶层 base_url/auth_token（spec §4 形态）必须注入 env 键——settings 旧值不得漏出
+    $accBare = @{ id = 'glm-9'; label = '裸号'; base_url = 'https://bare.example'; auth_token = 'bare-token'; env = @{ ANTHROPIC_MODEL = 'glm-5.3[1M]' } }
+    $m2 = Merge-CcxEnv -Account $accBare
+    Assert-Equal 'https://bare.example' $m2['ANTHROPIC_BASE_URL'] '顶层 base_url 注入'
+    Assert-Equal 'bare-token' $m2['ANTHROPIC_AUTH_TOKEN'] '顶层 auth_token 注入'
+
     # ②③ 临时文件：无 BOM、内容可回读、陈旧清理
     $env:TEMP = $testHome
     $stale = Join-Path $testHome 'ccx-settings-stale.json'
