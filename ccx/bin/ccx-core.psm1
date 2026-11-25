@@ -255,3 +255,139 @@ function Select-CcxAccount {
     $State['accounts'][$chosen['id']]['last_used_at'] = $Now.ToString('o')
     return @{ Account = $chosen; Panel = ($lines -join "`n") }
 }
+
+function Invoke-CcxProbe {
+    # 最小探针：POST <base_url>/v1/messages，max_tokens=1；-Probe 为测试注入口
+    param([Parameter(Mandatory = $true)][hashtable]$Account, [scriptblock]$Probe)
+    if ($Probe) { return (& $Probe -Account $Account) }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $uri = ([string]$Account['base_url']).TrimEnd('/') + '/v1/messages'
+    $headers = @{
+        'Authorization'       = 'Bearer ' + $Account['auth_token']
+        'anthropic-version'   = '2023-06-01'
+    }
+    $model = $Account['env']['ANTHROPIC_MODEL']
+    if (-not $model) { $model = 'claude-3-5-haiku-20241022' }
+    $body = ConvertTo-Json -Depth 5 -InputObject @{
+        model      = $model
+        max_tokens = 1
+        messages   = @(@{ role = 'user'; content = 'hi' })
+    }
+    try {
+        $resp = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 10 -UseBasicParsing
+        return @{ Status = [int]$resp.StatusCode; Body = [string]$resp.Content; NetworkError = $false }
+    } catch {
+        $resp = $_.Exception.Response
+        if ($resp) {
+            $code = [int]$resp.StatusCode
+            $bodyTxt = ''
+            try {
+                $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                $bodyTxt = $sr.ReadToEnd()
+            } catch {}
+            return @{ Status = $code; Body = $bodyTxt; NetworkError = $false }
+        }
+        return @{ Status = 0; Body = [string]$_.Exception.Message; NetworkError = $true }
+    }
+}
+
+function Invoke-CcxPreflight {
+    # 分类顺序（保守，不误杀）：401→blocked → Body 余额/欠费→daily → 429→r429 → 其余不标只警告
+    param([Parameter(Mandatory = $true)][hashtable]$Account, [scriptblock]$Probe)
+    $r = Invoke-CcxProbe -Account $Account -Probe:$Probe
+    $status = [int]$r['Status']
+    $body = [string]$r['Body']
+    if ($body.Length -gt 120) { $body = $body.Substring(0, 120) + '…' }
+    $ok = ($status -ge 200 -and $status -lt 300)
+    if ($ok) { return @{ Ok = $true; Marked = $null; Detail = 'ok' } }
+    if ($status -eq 401) {
+        Set-CcxAccountStatus -Id $Account['id'] -Status 'blocked' -Note 'preflight 401'
+        return @{ Ok = $false; Marked = 'blocked'; Detail = ('HTTP 401 ' + $body) }
+    }
+    if ($body -match '(?i)余额|欠费|insufficient|额度|exhaust') {
+        Set-CcxAccountStatus -Id $Account['id'] -Status 'daily' -Note 'preflight 余额/欠费'
+        return @{ Ok = $false; Marked = 'daily'; Detail = $body }
+    }
+    if ($status -eq 429) {
+        Set-CcxAccountStatus -Id $Account['id'] -Status 'r429' -Note 'preflight 429'
+        return @{ Ok = $false; Marked = 'r429'; Detail = ('HTTP 429 ' + $body) }
+    }
+    # 未知错误/网络错/5xx → 不标记（可能是本机网络问题，不能把号全杀）
+    return @{ Ok = $false; Marked = $null; Detail = ('HTTP ' + $status + ' ' + $body) }
+}
+
+function Select-AndPreflight {
+    # 选号→预检→失败已标记者换下一号（上限=池大小）；StrongId 预检失败不接力（尊重强指）；
+    # -NoCheck 跳过预检；未标记异常照常用该号启动；全不可用 → Account=$null + 全池面板
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Registry,
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][hashtable]$Group,
+        [switch]$NoCheck,
+        [string]$StrongId,
+        [scriptblock]$Probe,
+        [datetime]$Now = (Get-Date)
+    )
+    $warnings = @()
+    if (-not $Group -or -not $Group['Accounts'] -or @($Group['Accounts']).Count -eq 0) {
+        return @{ Account = $null; Warnings = $warnings; Panel = '  号池为空（ccx add 添加账号）' }
+    }
+
+    if ($StrongId) {
+        $acc = @($Group['Accounts'] | Where-Object { $_['id'] -eq $StrongId } | Select-Object -First 1)
+        if (-not $acc -or $acc.Count -eq 0) {
+            return @{ Account = $null; Warnings = $warnings; Panel = ('  强指号不存在: ' + $StrongId) }
+        }
+        $acc = $acc[0]
+        $eff = Get-CcxEffectiveStatus -State $State -Id $acc['id'] -Now $Now
+        if ($eff -ne 'ok') { $warnings += ('{0} 当前状态 {1}（强指尊重选择）' -f $acc['id'], $eff) }
+        Save-CcxState -State $State
+        if (-not $NoCheck) {
+            $pf = Invoke-CcxPreflight -Account $acc -Probe:$Probe
+            if (-not $pf['Ok']) {
+                $warnings += ('{0} 预检失败：{1}（强指不接力，仍用该号启动）' -f $acc['id'], $pf['Detail'])
+            }
+        }
+        return @{ Account = $acc; Warnings = $warnings; Panel = ($warnings -join "`n") }
+    }
+
+    $pool = @($Group['Accounts'])
+    for ($i = 0; $i -lt $pool.Count; $i++) {
+        $sel = Select-CcxAccount -Registry $Registry -State $State -Group $Group -Now $Now
+        if ($null -eq $sel['Account']) { return @{ Account = $null; Warnings = $warnings; Panel = $sel['Panel'] } }
+        $acc = $sel['Account']
+        Save-CcxState -State $State
+        if ($NoCheck) { return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] } }
+        $pf = Invoke-CcxPreflight -Account $acc -Probe:$Probe
+        if ($pf['Ok']) { return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] } }
+        if ($pf['Marked']) {
+            $warnings += ('{0} 预检失败已标 {1}：{2}，换下一号' -f $acc['id'], $pf['Marked'], $pf['Detail'])
+            $State = Read-CcxState   # 取回标记，防同号复读
+            continue
+        }
+        $warnings += ('{0} 预检异常（未标记，可能本机网络问题）：{1}，仍用该号启动' -f $acc['id'], $pf['Detail'])
+        return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] }
+    }
+    # 上限耗尽（理论不可达：每轮要么返回要么标记）→ 兜底再选一次
+    $sel = Select-CcxAccount -Registry $Registry -State $State -Group $Group -Now $Now
+    return @{ Account = $sel['Account']; Warnings = $warnings; Panel = $sel['Panel'] }
+}
+
+function Invoke-CcxCheck {
+    # 全池逐号预检 + 面板（ccx check 用）
+    param([Parameter(Mandatory = $true)][hashtable]$Registry, [Parameter(Mandatory = $true)][hashtable]$State, [scriptblock]$Probe)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($a in @($Registry['accounts'])) {
+        if ($a['enabled'] -eq $false) {
+            $lines.Add(('  {0,-8} {1,-10} 已停用' -f $a['id'], $a['label']))
+            continue
+        }
+        $pf = Invoke-CcxPreflight -Account $a -Probe:$Probe
+        if ($pf['Ok']) { $txt = 'ok' }
+        elseif ($pf['Marked']) { $txt = '失败→已标 ' + $pf['Marked'] }
+        else { $txt = '异常(未标)' }
+        $lines.Add(('  {0,-8} {1,-10} {2}  {3}' -f $a['id'], $a['label'], $txt, $pf['Detail']))
+    }
+    return ($lines -join "`n")
+}
