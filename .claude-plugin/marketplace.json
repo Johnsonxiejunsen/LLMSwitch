@@ -13,6 +13,11 @@
       "name": "llm-cost",
       "source": "./llm-cost",
       "description": "通用 LLM 使用成本计算: 单价注册表×token 分档, 手报/文件/SQL/余额四源"
+    },
+    {
+      "name": "ccx",
+      "source": "./ccx",
+      "description": "号池启动器: 同厂商多号自动切换/启动预检/状态面板, claude 透传不改设置"
     }
   ]
 }
