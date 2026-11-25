@@ -70,6 +70,64 @@ function Save-CcxState {
     Save-CcxJson -Path (Join-Path (Get-CcxHome) 'state.json') -Data $State
 }
 
+function Get-CcxNextReset {
+    # 账号下一次 reset_time 时刻（本地）；now 早于今日 reset → 今日，否则明日
+    param([Parameter(Mandatory = $true)][string]$Id, [datetime]$Now = (Get-Date))
+    $reset = '00:00'
+    $reg = Read-CcxRegistry
+    if ($null -ne $reg -and $reg['accounts']) {
+        foreach ($a in $reg['accounts']) {
+            if ($a['id'] -eq $Id -and $a['reset_time']) { $reset = $a['reset_time']; break }
+        }
+    }
+    $parts = $reset.Split(':')
+    $candidate = $Now.Date.AddHours([int]$parts[0]).AddMinutes([int]$parts[1])
+    if ($candidate -le $Now) { $candidate = $candidate.AddDays(1) }
+    return $candidate
+}
+
+function Get-CcxEffectiveStatus {
+    # 惰性清冷却：r429/daily 且 until ≤ Now → 视为 ok 并回写传入 State
+    param([Parameter(Mandatory = $true)][hashtable]$State, [Parameter(Mandatory = $true)][string]$Id, [datetime]$Now = (Get-Date))
+    $acc = $State['accounts']
+    if ($null -eq $acc -or -not $acc.Contains($Id) -or $null -eq $acc[$Id]) { return 'ok' }
+    $st = $acc[$Id]
+    $status = $st['status']
+    if (-not $status) { return 'ok' }
+    if ($status -eq 'ok' -or $status -eq 'blocked') { return $status }
+    $until = $null
+    if ($st.Contains('until') -and $st['until']) { $until = [datetime]$st['until'] }
+    if ($null -ne $until -and $until -le $Now) {
+        $st['status'] = 'ok'
+        $st['updated_at'] = $Now.ToString('o')
+        $st.Remove('until')
+        return 'ok'
+    }
+    return $status
+}
+
+function Set-CcxAccountStatus {
+    # r429→until=Now+60s；daily→下一次 reset_time；blocked→无 until；均记 updated_at
+    param([Parameter(Mandatory = $true)][string]$Id, [Parameter(Mandatory = $true)][string]$Status, [string]$Note, [datetime]$Now = (Get-Date))
+    $state = Read-CcxState
+    if (-not $state['accounts'].Contains($Id)) { $state['accounts'][$Id] = @{} }
+    $st = $state['accounts'][$Id]
+    $st['status'] = $Status
+    $st['updated_at'] = $Now.ToString('o')
+    if ($Note) { $st['note'] = $Note } else { $st.Remove('note') }
+    switch ($Status) {
+        'r429'    { $st['until'] = $Now.AddSeconds(60).ToString('o') }
+        'daily'   { $st['until'] = (Get-CcxNextReset -Id $Id -Now $Now).ToString('o') }
+        default   { $st.Remove('until') }   # ok/blocked 不携带 until
+    }
+    Save-CcxState -State $state
+}
+
+function Unlock-CcxAccount {
+    param([Parameter(Mandatory = $true)][string]$Id)
+    Set-CcxAccountStatus -Id $Id -Status 'ok'
+}
+
 function New-CcxRegistrySample {
     # spec §4 样例；auth_token 为占位符，真实 token 永不入仓
     return @{
