@@ -1,4 +1,6 @@
 ﻿# ccx 测试断言原语 — 失败即 throw（子进程退出码非零）
+# Stop 是 harness 契约：无它，command-not-found 只跳过当前语句，测试假绿 exit 0
+$ErrorActionPreference = 'Stop'
 $script:AssertCount = 0
 
 function Assert-True {
