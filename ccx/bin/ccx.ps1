@@ -42,7 +42,7 @@ function Invoke-CcxInstall {
 }
 
 try {
-    if ($args.Count -eq 0) { Show-CcxUsage; exit 1 }
+    # 裸 ccx（无参数）= 交互选模型并启动（spec §7 首行），不做 usage 早退（终审#1）
     $cmd = [string]$args[0]
     switch ($cmd) {        'list' { Invoke-CcxList | Write-Output }
         'mark' {

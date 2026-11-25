@@ -86,6 +86,16 @@ try {
     # registry 路由到 CCX_HOME\registry.json
     Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data $sample
     Assert-Equal 'bigmodel' (Read-CcxRegistry)['models']['glm']['vendor'] 'Read-CcxRegistry 读 CCX_HOME'
+
+    # ⑥ Write-CcxTextAtomic：新建/覆写内容精确、无 BOM、无 tmp 残留（set-default 原子写同构件，终审#3）
+    $ap = Join-Path $testHome 'atomic.json'
+    Write-CcxTextAtomic -Path $ap -Content '{"a":1}'
+    Assert-Equal '{"a":1}' ([IO.File]::ReadAllText($ap)) '原子写新建内容'
+    Write-CcxTextAtomic -Path $ap -Content '{"a":2}'
+    Assert-Equal '{"a":2}' ([IO.File]::ReadAllText($ap)) '原子写覆写内容'
+    $ab = [IO.File]::ReadAllBytes($ap)
+    Assert-True (-not ($ab[0] -eq 0xEF -and $ab[1] -eq 0xBB -and $ab[2] -eq 0xBF)) '原子写无 BOM'
+    Assert-Equal 0 @(Get-ChildItem $testHome -Filter '*.tmp' -Recurse).Count '原子写无 tmp 残留'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue

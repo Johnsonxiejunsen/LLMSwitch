@@ -35,15 +35,16 @@ function Read-CcxJson {
     }
 }
 
-function Save-CcxJson {
-    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][hashtable]$Data)
+function Write-CcxTextAtomic {
+    # 原子写文本：tmp 落盘 → 目标存在则 File.Replace（原子换名）否则 Move；无 BOM
+    # Save-CcxJson 与 set-default 写 settings.json 共用（settings.json 是裸 claude 兜底层，写坏代价最高）
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Content)
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
-    $json = ConvertTo-Json -InputObject $Data -Depth 10
     $tmp = $Path + '.tmp'
-    [IO.File]::WriteAllText($tmp, $json, $script:CcxUtf8NoBom)
+    [IO.File]::WriteAllText($tmp, $Content, $script:CcxUtf8NoBom)
     # .NET Framework 的 Move 不能覆盖已存在文件 → 存在则 Replace（原子换名），不存在才 Move
     # 注意：PS 把 $null 绑到 [string] 会变空串（合法路径报错），必须 [NullString]::Value
     if (Test-Path -LiteralPath $Path) {
@@ -51,6 +52,11 @@ function Save-CcxJson {
     } else {
         [IO.File]::Move($tmp, $Path)
     }
+}
+
+function Save-CcxJson {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][hashtable]$Data)
+    Write-CcxTextAtomic -Path $Path -Content (ConvertTo-Json -InputObject $Data -Depth 10)
 }
 
 function Read-CcxRegistry {
@@ -323,7 +329,9 @@ function Select-AndPreflight {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Registry,
         [Parameter(Mandatory = $true)][hashtable]$State,
-        [Parameter(Mandatory = $true)][hashtable]$Group,
+        # 终审#2：全停用组时上层会传 $null（Get-CcxVendorGroup 对 0 个可用号返回 null），
+        # Mandatory 遇显式 $null 在真控制台会转交互提示（假挂）→ AllowNull + 下方空组护栏
+        [Parameter(Mandatory = $true)][AllowNull()][hashtable]$Group,
         [switch]$NoCheck,
         [string]$StrongId,
         [scriptblock]$Probe,
@@ -331,7 +339,7 @@ function Select-AndPreflight {
     )
     $warnings = @()
     if (-not $Group -or -not $Group['Accounts'] -or @($Group['Accounts']).Count -eq 0) {
-        return @{ Account = $null; Warnings = $warnings; Panel = '  号池为空（ccx add 添加账号）' }
+        return @{ Account = $null; Warnings = $warnings; Panel = '  该模型组没有可用账号（全部停用或未配置，ccx list 查看 / ccx add 添加）' }
     }
 
     if ($StrongId) {
@@ -600,8 +608,7 @@ function Invoke-CcxSetDefault {
     if ($acc['env'] -is [hashtable]) {
         foreach ($k in @($acc['env'].Keys)) { $settings['env'][$k] = $acc['env'][$k] }
     }
-    $json = ConvertTo-Json -Depth 32 -InputObject $settings
-    [IO.File]::WriteAllText($sp, $json, $script:CcxUtf8NoBom)
+    Write-CcxTextAtomic -Path $sp -Content (ConvertTo-Json -Depth 32 -InputObject $settings)
 
     $reg['default_account'] = $Id
     Save-CcxJson -Path (Join-Path (Get-CcxHome) 'registry.json') -Data $reg
@@ -666,7 +673,13 @@ function Invoke-CcxLaunch {
                 Write-Output '选择模型组:'
                 for ($i = 0; $i -lt $vendors.Count; $i++) {
                     $g = Get-CcxVendorGroup -Registry $reg -Vendor $vendors[$i]
-                    Write-Output ('  ' + ($i + 1) + '. ' + $g['Label'] + '（' + $vendors[$i] + '，' + @($g['Accounts']).Count + ' 个号）')
+                    $cnt = 0
+                    if ($g) { $cnt = @($g['Accounts']).Count }
+                    $lbl = $vendors[$i]
+                    if ($reg['models'] -is [hashtable]) {
+                        foreach ($k in @($reg['models'].Keys)) { if ($reg['models'][$k]['vendor'] -eq $vendors[$i]) { $lbl = $reg['models'][$k]['label']; break } }
+                    }
+                    Write-Output ('  ' + ($i + 1) + '. ' + $lbl + '（' + $vendors[$i] + '，' + $cnt + ' 个号）')
                 }
                 $choice = Read-Host '输入编号'
                 $n = 0

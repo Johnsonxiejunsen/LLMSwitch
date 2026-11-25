@@ -50,6 +50,7 @@ try {
     Assert-Equal 'Bash(git status:*)' $back['permissions']['allow'][0] 'permissions 原样'
     Assert-Equal $true $back['enabledPlugins']['llm-cost@claude-tools'] 'enabledPlugins 原样'
     Assert-Equal 'glm-2' (Read-CcxRegistry)['default_account'] 'registry 记默认号'
+    Assert-Equal 0 @(Get-ChildItem $testHome -Filter '*.tmp').Count 'set-default 原子写无 tmp 残留'
 
     # 同步后无漂移提示；手改 token 后出现漂移提示
     $listSync = Invoke-CcxList
