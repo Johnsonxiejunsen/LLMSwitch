@@ -434,3 +434,173 @@ function Remove-CcxTempSettings {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
 }
+
+function Get-CcxSnapshotDrift {
+    # settings.json 快照的 BASE_URL/TOKEN ≠ registry 默认号 → 漂移提示（无默认号/无 settings → 不提示）
+    param([Parameter(Mandatory = $true)][hashtable]$Registry)
+    $defId = $Registry['default_account']
+    if (-not $defId) { return $null }
+    $acc = @($Registry['accounts'] | Where-Object { $_['id'] -eq $defId } | Select-Object -First 1)
+    if ($acc.Count -eq 0) { return $null }
+    $acc = $acc[0]
+    $settings = Read-CcxJson -Path (Get-CcxSettingsPath)
+    if ($null -eq $settings -or -not ($settings['env'] -is [hashtable])) { return $null }
+    if (($settings['env']['ANTHROPIC_BASE_URL'] -ne $acc['base_url']) -or ($settings['env']['ANTHROPIC_AUTH_TOKEN'] -ne $acc['auth_token'])) {
+        return ('settings.json 快照 ≠ 默认号 ' + $defId + '，ccx set-default 可同步')
+    }
+    return $null
+}
+
+function Invoke-CcxList {
+    # 全池面板（按 vendor 分节）+ 快照漂移提示
+    $reg = Read-CcxRegistry
+    if ($null -eq $reg -or -not $reg['accounts'] -or @($reg['accounts']).Count -eq 0) {
+        return '  号池为空（ccx add 添加账号）'
+    }
+    $state = Read-CcxState
+    $now = Get-Date
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lastVendor = $null
+    foreach ($a in @($reg['accounts'])) {
+        if ($a['vendor'] -ne $lastVendor) {
+            $lines.Add('')
+            $lines.Add('[' + $a['vendor'] + ']')
+            $lastVendor = $a['vendor']
+        }
+        $eff = Get-CcxEffectiveStatus -State $state -Id $a['id'] -Now $now
+        $st = $state['accounts'][$a['id']]
+        $txt = [string]$eff
+        if ($eff -ne 'ok' -and $null -ne $st -and $st['until']) {
+            $txt += '（恢复 ' + (Format-CcxUntil -Until ([datetime]$st['until']) -Now $now) + '）'
+        }
+        if ($a['enabled'] -eq $false) { $txt += ' 已停用' }
+        if ($reg['default_account'] -eq $a['id']) { $txt += ' *默认' }
+        $lines.Add(('  {0,-8} {1,-10} {2}' -f $a['id'], $a['label'], $txt))
+    }
+    Save-CcxState -State $state   # 持久化惰性清冷却
+    $hint = Get-CcxSnapshotDrift -Registry $reg
+    if ($hint) { $lines.Add(''); $lines.Add('  ⚠ ' + $hint) }
+    return ($lines -join "`n")
+}
+
+function Invoke-CcxMark {
+    param([Parameter(Mandatory = $true)][string]$Id, [Parameter(Mandatory = $true)][string]$Status)
+    if (@('r429', 'daily', 'blocked') -notcontains $Status) {
+        throw ('未知状态: ' + $Status + '（可用 r429|daily|blocked）')
+    }
+    $reg = Read-CcxRegistry
+    if ($null -eq $reg -or @($reg['accounts'] | Where-Object { $_['id'] -eq $Id }).Count -eq 0) {
+        throw ('号不存在: ' + $Id)
+    }
+    Set-CcxAccountStatus -Id $Id -Status $Status -Note '手动标记'
+    Write-Output ('已标记 ' + $Id + ' → ' + $Status)
+}
+
+function Invoke-CcxUnlock {
+    param([Parameter(Mandatory = $true)][string]$Id)
+    $reg = Read-CcxRegistry
+    if ($null -eq $reg -or @($reg['accounts'] | Where-Object { $_['id'] -eq $Id }).Count -eq 0) {
+        throw ('号不存在: ' + $Id)
+    }
+    Unlock-CcxAccount -Id $Id
+    Write-Output ('已解锁 ' + $Id)
+}
+
+function Invoke-CcxAdd {
+    # 向导式加号；-Answers 为非交互注入（测试/脚本用）。env 模板 = settings.json 的 ANTHROPIC_* 键改值
+    param([hashtable]$Answers)
+    $reg = Read-CcxRegistry
+    if ($null -eq $reg) { $reg = @{ schema = 1; models = @{}; accounts = @() } }
+    if (-not $reg['models']) { $reg['models'] = @{} }
+    if (-not $reg['accounts']) { $reg['accounts'] = @() }
+
+    if ($Answers) {
+        $label = $Answers['label']; $vendor = $Answers['vendor']; $baseUrl = $Answers['base_url']
+        $token = $Answers['token']; $model = $Answers['model']
+    } else {
+        $label = Read-Host '标签（如 智谱主力）'
+        $vendor = Read-Host '厂商（如 bigmodel）'
+        $baseUrl = Read-Host 'base_url（如 https://open.bigmodel.cn/api/anthropic）'
+        $token = Read-Host 'auth_token'
+        $model = Read-Host '模型全名（如 glm-5.3[1M]）'
+    }
+    foreach ($pair in @(@('label', $label), @('vendor', $vendor), @('base_url', $baseUrl), @('auth_token', $token), @('model', $model))) {
+        if (-not $pair[1]) { throw ('缺少必填项: ' + $pair[0]) }
+    }
+    $shortModel = $model -replace '\[.*\]$'
+
+    $env = @{}
+    $settings = Read-CcxJson -Path (Get-CcxSettingsPath)
+    if ($null -ne $settings -and $settings['env'] -is [hashtable]) {
+        foreach ($k in @($settings['env'].Keys)) {
+            if ($k -like 'ANTHROPIC_*') { $env[$k] = $settings['env'][$k] }
+        }
+    }
+    $env['ANTHROPIC_BASE_URL'] = $baseUrl
+    $env['ANTHROPIC_AUTH_TOKEN'] = $token
+    foreach ($k in @($env.Keys)) {
+        if ($k -like '*MODEL*') {
+            if ($k -like '*_NAME') { $env[$k] = $shortModel } else { $env[$k] = $model }
+        }
+    }
+
+    $n = 1
+    while (@($reg['accounts'] | Where-Object { $_['id'] -eq ($vendor + '-' + $n) }).Count -gt 0) { $n++ }
+    $id = $vendor + '-' + $n
+    $maxP = 0
+    foreach ($a in @($reg['accounts'])) { if ($a['priority']) { $p = [int]$a['priority']; if ($p -gt $maxP) { $maxP = $p } } }
+
+    $reg['accounts'] += , @{ id = $id; label = $label; vendor = $vendor; base_url = $baseUrl; auth_token = $token; env = $env; priority = ($maxP + 1); reset_time = '00:00'; enabled = $true }
+    $hasVendorAlias = $false
+    foreach ($k in @($reg['models'].Keys)) { if ($reg['models'][$k]['vendor'] -eq $vendor) { $hasVendorAlias = $true; break } }
+    if (-not $hasVendorAlias) { $reg['models'][$vendor] = @{ vendor = $vendor; label = $vendor } }
+    Save-CcxJson -Path (Join-Path (Get-CcxHome) 'registry.json') -Data $reg
+    return $id
+}
+
+function Invoke-CcxRm {
+    param([Parameter(Mandatory = $true)][string]$Id)
+    $reg = Read-CcxRegistry
+    if ($null -eq $reg) { throw 'registry 不存在' }
+    $before = @($reg['accounts']).Count
+    $rest = @($reg['accounts'] | Where-Object { $_['id'] -ne $Id })
+    if ($rest.Count -eq $before) { throw ('号不存在: ' + $Id) }
+    $reg['accounts'] = $rest
+    if ($reg['default_account'] -eq $Id) { $reg.Remove('default_account') }
+    Save-CcxJson -Path (Join-Path (Get-CcxHome) 'registry.json') -Data $reg
+    $state = Read-CcxState
+    if ($state['accounts'].Contains($Id)) { $state['accounts'].Remove($Id); Save-CcxState -State $state }
+    Write-Output ('已删除 ' + $Id)
+}
+
+function Invoke-CcxSetDefault {
+    # registry 记 default_account + settings.json 同步（唯一写 settings.json 的入口）
+    # 顺序：解析(失败即抛，未写) → 备份 → 只覆盖 env 指定键 → 无 BOM 写回
+    param([Parameter(Mandatory = $true)][string]$Id)
+    $reg = Read-CcxRegistry
+    if ($null -eq $reg) { throw 'registry 不存在' }
+    $acc = @($reg['accounts'] | Where-Object { $_['id'] -eq $Id } | Select-Object -First 1)
+    if ($acc.Count -eq 0) { throw ('号不存在: ' + $Id) }
+    $acc = $acc[0]
+
+    $sp = Get-CcxSettingsPath
+    if (-not (Test-Path -LiteralPath $sp)) { throw ('settings 不存在: ' + $sp) }
+    $settings = Read-CcxJson -Path $sp
+    if ($null -eq $settings) { throw ('settings.json 为空，无法同步: ' + $sp) }
+    if (-not ($settings['env'] -is [hashtable])) { $settings['env'] = @{} }
+
+    $bak = $sp + '.bak-ccx-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    [IO.File]::Copy($sp, $bak, $true)
+
+    $settings['env']['ANTHROPIC_BASE_URL'] = $acc['base_url']
+    $settings['env']['ANTHROPIC_AUTH_TOKEN'] = $acc['auth_token']
+    if ($acc['env'] -is [hashtable]) {
+        foreach ($k in @($acc['env'].Keys)) { $settings['env'][$k] = $acc['env'][$k] }
+    }
+    $json = ConvertTo-Json -Depth 32 -InputObject $settings
+    [IO.File]::WriteAllText($sp, $json, $script:CcxUtf8NoBom)
+
+    $reg['default_account'] = $Id
+    Save-CcxJson -Path (Join-Path (Get-CcxHome) 'registry.json') -Data $reg
+    Write-Output ('默认号已设为 ' + $Id + '，settings.json 已同步（备份: ' + (Split-Path $bak -Leaf) + '）')
+}
