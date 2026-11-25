@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $script:AssertCount = 0
 
 function Assert-True {
-    param([bool]$Condition, [string]$Message = 'Assert-True failed')
+    param($Condition, [string]$Message = 'Assert-True failed')
     $script:AssertCount++
     if (-not $Condition) { throw "[assert #$($script:AssertCount)] $Message" }
 }

@@ -159,3 +159,99 @@ function New-CcxRegistrySample {
         )
     }
 }
+
+function Format-CcxUntil {
+    param([Parameter(Mandatory = $true)][datetime]$Until, [datetime]$Now = (Get-Date))
+    if ($Until.Date -eq $Now.Date) { return '今日 ' + $Until.ToString('HH:mm') }
+    if ($Until.Date -eq $Now.Date.AddDays(1)) { return '明日 ' + $Until.ToString('HH:mm') }
+    return $Until.ToString('MM-dd HH:mm')
+}
+
+function Resolve-CcxModelGroup {
+    # 'glm' 走 models 节；'glm@g1' 强指 id；'' 唯一 vendor 直取（多组 null=上层出菜单）；models 缺失按 vendor 兜底
+    param([string]$ModelSpec, [Parameter(Mandatory = $true)][hashtable]$Registry)
+    $accounts = @($Registry['accounts'] | Where-Object { $_ -and $_['enabled'] -ne $false })
+    if ($accounts.Count -eq 0) { return $null }
+
+    $alias = [string]$ModelSpec
+    $strongId = $null
+    if ($alias.Contains('@')) {
+        $parts = $alias -split '@'
+        $alias = $parts[0]
+        $strongId = $parts[1]
+    }
+
+    $vendor = $null; $label = $null
+    $models = $Registry['models']
+    if ($alias) {
+        if ($models -is [hashtable] -and $models.Contains($alias)) {
+            $vendor = $models[$alias]['vendor']
+            $label = $models[$alias]['label']
+        } elseif ($strongId) {
+            # models 节缺失但强指了 id → 按该账号自身 vendor 兜底
+            $hit = @($accounts | Where-Object { $_['id'] -eq $strongId })
+            if ($hit.Count -gt 0) { $vendor = $hit[0]['vendor']; $label = $vendor }
+        }
+        if (-not $vendor) { return $null }
+    } else {
+        $vendors = @($accounts | ForEach-Object { $_['vendor'] } | Select-Object -Unique)
+        if ($vendors.Count -ne 1) { return $null }
+        $vendor = $vendors[0]
+        if ($models -is [hashtable]) {
+            foreach ($k in @($models.Keys)) { if ($models[$k]['vendor'] -eq $vendor) { $label = $models[$k]['label']; break } }
+        }
+        if (-not $label) { $label = $vendor }
+    }
+
+    $groupAccounts = @($accounts | Where-Object { $_['vendor'] -eq $vendor })
+    if ($strongId) { $groupAccounts = @($groupAccounts | Where-Object { $_['id'] -eq $strongId }) }
+    if ($groupAccounts.Count -eq 0) { return $null }
+    return @{ Vendor = $vendor; Label = $label; Accounts = $groupAccounts }
+}
+
+function Find-EarliestRecovery {
+    # 有 until（r429/daily）的号里取最早恢复者；全 blocked/无 until → null
+    param([Parameter(Mandatory = $true)][hashtable]$State, [Parameter(Mandatory = $true)]$Accounts)
+    $best = $null
+    foreach ($a in @($Accounts)) {
+        $st = $State['accounts'][$a['id']]
+        if ($null -eq $st -or -not $st['until']) { continue }
+        $u = [datetime]$st['until']
+        if ($null -eq $best -or $u -lt $best['Until']) { $best = @{ Id = $a['id']; Until = $u } }
+    }
+    return $best
+}
+
+function Select-CcxAccount {
+    # 调用方契约：State 为读写对象（惰性清冷却 + last_used_at 回写在此），调用后由上层 Save-CcxState
+    # priority 升序、并列取 last_used_at 最旧（缺省最旧）；全不可用 → Account=null + 全池面板
+    param([Parameter(Mandatory = $true)][hashtable]$Registry, [Parameter(Mandatory = $true)][hashtable]$State, [Parameter(Mandatory = $true)][hashtable]$Group, [datetime]$Now = (Get-Date))
+    $lines = New-Object System.Collections.Generic.List[string]
+    $okAccounts = @()
+    foreach ($a in @($Group['Accounts'])) {
+        $eff = Get-CcxEffectiveStatus -State $State -Id $a['id'] -Now $Now
+        $st = $State['accounts'][$a['id']]
+        $untilTxt = ''
+        if ($eff -ne 'ok' -and $null -ne $st -and $st['until']) {
+            $untilTxt = '（恢复 ' + (Format-CcxUntil -Until ([datetime]$st['until']) -Now $Now) + '）'
+        }
+        $lines.Add(('  {0,-8} {1,-10} {2}{3}' -f $a['id'], $a['label'], $eff, $untilTxt))
+        if ($eff -eq 'ok') { $okAccounts += ,$a }
+    }
+    if ($okAccounts.Count -eq 0) {
+        $er = Find-EarliestRecovery -State $State -Accounts $Group['Accounts']
+        $tail = '  全池不可用，最早恢复 '
+        if ($er) { $tail += $er['Id'] + ' ' + (Format-CcxUntil -Until $er['Until'] -Now $Now) }
+        else { $tail += '—（blocked 需 ccx unlock 手动解锁）' }
+        $lines.Add($tail)
+        return @{ Account = $null; Panel = ($lines -join "`n") }
+    }
+    $sortProps = @(
+        @{ Expression = { if ($_['priority']) { [int]$_['priority'] } else { 999 } } }
+        @{ Expression = { $rec = $State['accounts'][$_['id']]; if ($rec -and $rec['last_used_at']) { [datetime]$rec['last_used_at'] } else { [datetime]::MinValue } } }
+    )
+    $chosen = @($okAccounts | Sort-Object -Property $sortProps)[0]
+    if (-not $State['accounts'].Contains($chosen['id'])) { $State['accounts'][$chosen['id']] = @{} }
+    $State['accounts'][$chosen['id']]['last_used_at'] = $Now.ToString('o')
+    return @{ Account = $chosen; Panel = ($lines -join "`n") }
+}
