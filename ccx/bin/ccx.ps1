@@ -16,6 +16,29 @@ function Show-CcxUsage {
     Write-Output '  ccx add | ccx rm <id>     号池维护'
     Write-Output '  ccx set-default <id>      默认号 + settings.json 同步'
     Write-Output '  ccx check                 全池逐号预检'
+    Write-Output '  ccx install               把 ccx 命令装进 PowerShell profile'
+}
+
+function Invoke-CcxInstall {
+    # profile 注入 function ccx（幂等：标记已存在则跳过）。块内容纯 ASCII，规避 PS 5.1 无 BOM 中文坑
+    $p = $env:CCX_PROFILE_PATH
+    if (-not $p) { $p = $PROFILE.CurrentUserAllHosts }
+    $marker = '# >>> ccx launcher >>>'
+    if (Test-Path -LiteralPath $p) {
+        $existing = [IO.File]::ReadAllText($p)
+        if ($existing.Contains($marker)) {
+            Write-Output ('ccx 已安装过（' + $p + '），跳过')
+            return
+        }
+    }
+    $dir = Split-Path -Parent $p
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $target = Join-Path $PSScriptRoot 'ccx.ps1'
+    $block = "`r`n" + $marker + "`r`n" +
+        ("function ccx { & '" + $target + "' @args }") + "`r`n" +
+        '# <<< ccx launcher <<<' + "`r`n"
+    [IO.File]::AppendAllText($p, $block, [System.Text.ASCIIEncoding]::ASCII)
+    Write-Output ('已安装 ccx → ' + $p + '（新开 PowerShell 窗口生效）')
 }
 
 try {
@@ -50,6 +73,7 @@ try {
                 Invoke-CcxCheck -Registry $reg -State (Read-CcxState) | Write-Output
             }
         }
+        'install' { Invoke-CcxInstall }
         default {
             # 启动路径：首个非 - 开头参数=模型别名(可 @id 强指)，其余透传 claude；--no-check 剥离
             $modelSpec = ''
