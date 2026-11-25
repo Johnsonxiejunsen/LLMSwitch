@@ -391,3 +391,46 @@ function Invoke-CcxCheck {
     }
     return ($lines -join "`n")
 }
+
+function Get-CcxSettingsPath {
+    # 测试缝：CCX_SETTINGS_PATH 覆盖默认 settings.json
+    if ($env:CCX_SETTINGS_PATH) { return $env:CCX_SETTINGS_PATH }
+    return (Join-Path $env:USERPROFILE '.claude\settings.json')
+}
+
+function Merge-CcxEnv {
+    # settings.json env ⊕ 账号 env ⊕ CCX_ACCOUNT_ID/LABEL（后写胜，按键合并非整块替换）
+    param([Parameter(Mandatory = $true)][hashtable]$Account)
+    $merged = @{}
+    $settings = Read-CcxJson -Path (Get-CcxSettingsPath)
+    if ($null -ne $settings -and $settings['env'] -is [hashtable]) {
+        foreach ($k in @($settings['env'].Keys)) { $merged[$k] = $settings['env'][$k] }
+    }
+    if ($Account['env'] -is [hashtable]) {
+        foreach ($k in @($Account['env'].Keys)) { $merged[$k] = $Account['env'][$k] }
+    }
+    $merged['CCX_ACCOUNT_ID'] = [string]$Account['id']
+    $merged['CCX_ACCOUNT_LABEL'] = [string]$Account['label']
+    return $merged
+}
+
+function Write-CcxTempSettings {
+    # %TEMP%\ccx-settings-<pid>.json（UTF8 无 BOM）；顺带清 >1h 陈旧件（claude 只在启动读一次，清了无害）
+    param([Parameter(Mandatory = $true)][hashtable]$Env)
+    $dir = $env:TEMP
+    if (-not $dir) { $dir = [IO.Path]::GetTempPath() }
+    try {
+        Get-ChildItem -Path $dir -Filter 'ccx-settings-*.json' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch {}
+    $path = Join-Path $dir ('ccx-settings-' + $PID + '.json')
+    $json = ConvertTo-Json -Depth 10 -InputObject @{ env = $Env }
+    [IO.File]::WriteAllText($path, $json, $script:CcxUtf8NoBom)
+    return $path
+}
+
+function Remove-CcxTempSettings {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+}
