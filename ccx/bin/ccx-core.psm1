@@ -166,6 +166,106 @@ function New-CcxRegistrySample {
     }
 }
 
+function ConvertTo-CcxVersionBase {
+    # §13 归一化同基：小写 + 去尾 [..] 变体标签 + 去非字母数字（glm5.4[1M] ≡ glm-5.4 → glm54）
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Id)
+    $s = $Id.ToLowerInvariant()
+    $s = $s -replace '\[[^\]]*\]\s*$', ''
+    return ($s -replace '[^a-z0-9]', '')
+}
+
+function Get-CcxVersionOptions {
+    # §13 选项合并：C(手配 versions，序=真相序，default_version 标默认) ⊕ B(在线发现，
+    # versions_include 过滤 + 同基去重后追加)。返回 @( @{Id; IsDefault; Source='local'|'remote'} )；$ModelNode 可 $null
+    param([AllowNull()]$ModelNode, [string[]]$Fetched = @())
+    $result = New-Object System.Collections.Generic.List[hashtable]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $default = $null
+    if ($ModelNode -is [hashtable] -and $ModelNode['default_version']) { $default = [string]$ModelNode['default_version'] }
+    if ($ModelNode -is [hashtable] -and $ModelNode['versions']) {
+        foreach ($v in @($ModelNode['versions'])) {
+            $id = $null
+            if ($v -is [hashtable]) { $id = [string]$v['id'] } elseif ($v) { $id = [string]$v }
+            if (-not $id) { continue }
+            $base = ConvertTo-CcxVersionBase -Id $id
+            if ($seen.Contains($base)) { continue }
+            [void]$seen.Add($base)
+            $result.Add(@{ Id = $id; IsDefault = ($id -eq $default); Source = 'local' })
+        }
+    }
+    $include = $null
+    if ($ModelNode -is [hashtable] -and $ModelNode['versions_include']) { $include = [string]$ModelNode['versions_include'] }
+    foreach ($f in @($Fetched)) {
+        $id = [string]$f
+        if (-not $id) { continue }
+        if ($include -and -not ($id -match $include)) { continue }
+        $base = ConvertTo-CcxVersionBase -Id $id
+        if ($seen.Contains($base)) { continue }
+        [void]$seen.Add($base)
+        $result.Add(@{ Id = $id; IsDefault = $false; Source = 'remote' })
+    }
+    return $result
+}
+
+function Resolve-CcxVersionInput {
+    # §13 菜单输入解析：空→默认版；数字→编号映射；全名→须在选项内；否则 throw 无效版本
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Choice, [object]$Options)
+    $opts = @($Options)
+    $c = $Choice.Trim()
+    if (-not $c) {
+        $def = @($opts | Where-Object { $_['IsDefault'] })
+        if ($def.Count -ge 1) { return [string]$def[0]['Id'] }
+        throw '无效版本选择：该组未配 default_version，请输入编号或列表中的全名'
+    }
+    if ($c -match '^[1-9][0-9]*$') {
+        $i = [int]$c - 1
+        if ($i -ge 0 -and $i -lt $opts.Count) { return [string]$opts[$i]['Id'] }
+        throw ('无效版本选择：编号 ' + $c + ' 超出范围（1-' + $opts.Count + '）')
+    }
+    foreach ($o in $opts) { if ([string]$o['Id'] -eq $c) { return $c } }
+    throw ('无效版本选择：' + $c + '（输入编号或列表中的全名）')
+}
+
+function Get-CcxRemoteVersions {
+    # §13 B 在线发现：GET <base_url>/v1/models（Bearer）；任何异常/畸形 → @() 静默（只当发现器，永不写回 registry）
+    # -Fetcher 缝：param($Url,$Headers,$TimeoutSec) → 响应文本（默认真 Invoke-WebRequest，4s 超时）
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Account,
+        [int]$TimeoutSec = 4,
+        [scriptblock]$Fetcher
+    )
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $url = ([string]$Account['base_url']).TrimEnd('/') + '/v1/models'
+        $headers = @{ 'Authorization' = 'Bearer ' + $Account['auth_token'] }
+        $txt = $null
+        if ($Fetcher) { $txt = [string](& $Fetcher -Url $url -Headers $headers -TimeoutSec $TimeoutSec) }
+        else {
+            $resp = Invoke-WebRequest -Uri $url -Method Get -Headers $headers -TimeoutSec $TimeoutSec -UseBasicParsing
+            $txt = [string]$resp.Content
+        }
+        $json = $txt | ConvertFrom-Json
+        $ids = @()
+        foreach ($d in @($json.data)) {
+            if ($d -and $d.PSObject.Properties['id']) { $ids += [string]$d.id }
+        }
+        return $ids
+    } catch {
+        return @()
+    }
+}
+
+function Get-CcxModelNode {
+    # §13 models 别名节按 vendor 命中（一 vendor 一节点）；未配/无 models 节 → $null
+    param([AllowNull()]$Registry, [Parameter(Mandatory = $true)][string]$Vendor)
+    if (-not $Registry -or -not $Registry['models']) { return $null }
+    foreach ($k in @($Registry['models'].Keys)) {
+        $node = $Registry['models'][$k]
+        if ($node -is [hashtable] -and [string]$node['vendor'] -eq $Vendor) { return $node }
+    }
+    return $null
+}
+
 function Format-CcxUntil {
     param([Parameter(Mandatory = $true)][datetime]$Until, [datetime]$Now = (Get-Date))
     if ($Until.Date -eq $Now.Date) { return '今日 ' + $Until.ToString('HH:mm') }
@@ -428,7 +528,9 @@ function Get-CcxSettingsPath {
 
 function Merge-CcxEnv {
     # settings.json env ⊕ 账号 env ⊕ CCX_ACCOUNT_ID/LABEL（后写胜，按键合并非整块替换）
-    param([Parameter(Mandatory = $true)][hashtable]$Account)
+    # -Version（§13）：ANTHROPIC_* 含 MODEL 的键——*_NAME ← 基名(去尾[..])、其余 ← 版本串；
+    #   并确保 ANTHROPIC_MODEL 与一条 *_NAME（缺则补 ANTHROPIC_DEFAULT_OPUS_MODEL_NAME）写入；其余键不动。无 -Version 与 A期逐字节一致
+    param([Parameter(Mandatory = $true)][hashtable]$Account, [string]$Version)
     $merged = @{}
     $settings = Read-CcxJson -Path (Get-CcxSettingsPath)
     if ($null -ne $settings -and $settings['env'] -is [hashtable]) {
@@ -442,6 +544,19 @@ function Merge-CcxEnv {
     if ($Account['auth_token']) { $merged['ANTHROPIC_AUTH_TOKEN'] = [string]$Account['auth_token'] }
     $merged['CCX_ACCOUNT_ID'] = [string]$Account['id']
     $merged['CCX_ACCOUNT_LABEL'] = [string]$Account['label']
+    if ($Version) {
+        $ver = [string]$Version
+        $base = $ver -replace '\[[^\]]*\]\s*$', ''
+        foreach ($k in @($merged.Keys)) {
+            if ($k -like 'ANTHROPIC*MODEL*') {
+                if ($k.EndsWith('_NAME')) { $merged[$k] = $base } else { $merged[$k] = $ver }
+            }
+        }
+        if (-not $merged.Contains('ANTHROPIC_MODEL')) { $merged['ANTHROPIC_MODEL'] = $ver }
+        $hasName = $false
+        foreach ($k in @($merged.Keys)) { if ($k -like 'ANTHROPIC*MODEL*' -and $k.EndsWith('_NAME')) { $hasName = $true; break } }
+        if (-not $hasName) { $merged['ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'] = $base }
+    }
     return $merged
 }
 
