@@ -668,7 +668,24 @@ function Invoke-CcxAdd {
         $vendor = Read-Host '厂商（如 bigmodel）'
         $baseUrl = Read-Host 'base_url（如 https://open.bigmodel.cn/api/anthropic）'
         $token = Read-Host 'auth_token'
-        $model = Read-Host '模型全名（如 glm-5.3[1M]）'
+        # §13：该厂商已配 versions → 打印编号列表可选（仍可自由输入全名；-Answers 注入路径零变化）
+        $addOpts = @()
+        if ($vendor) {
+            $addNode = Get-CcxModelNode -Registry $reg -Vendor $vendor
+            if ($addNode -and $addNode['versions']) { $addOpts = @(Get-CcxVersionOptions -ModelNode $addNode -Fetched @()) }
+        }
+        if ($addOpts.Count -gt 0) {
+            Write-Output '该组可选版本:'
+            for ($i = 0; $i -lt $addOpts.Count; $i++) {
+                $mk = ''
+                if ($addOpts[$i]['IsDefault']) { $mk = '（默认）' }
+                Write-Output ('  ' + ($i + 1) + '. ' + $addOpts[$i]['Id'] + $mk)
+            }
+        }
+        $model = Read-Host '模型全名（如 glm-5.3[1M]；可输上方编号）'
+        if ($model -match '^[1-9][0-9]*$' -and $addOpts.Count -gt 0) {
+            $model = Resolve-CcxVersionInput -Choice $model -Options $addOpts
+        }
     }
     foreach ($pair in @(@('label', $label), @('vendor', $vendor), @('base_url', $baseUrl), @('auth_token', $token), @('model', $model))) {
         if (-not $pair[1]) { throw ('缺少必填项: ' + $pair[0]) }

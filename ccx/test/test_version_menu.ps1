@@ -180,6 +180,32 @@ try {
     Assert-True ($txtD -notlike '*选择版本*') '无配置无菜单'
     $snapD = Read-CcxJson -Path $env:CCX_FAKE_SNAPSHOT
     Assert-Equal 'glm-4.6' $snapD['env']['ANTHROPIC_MODEL'] '无配置不覆盖（A期原样）'
+
+    # ⑮ add 向导：该厂商已配 versions → 打印编号列表，输入编号经 Resolve 解析（stdin 注入全向导）
+    [IO.File]::WriteAllText($fxPath, '{"env":{"ANTHROPIC_BASE_URL":"https://old.example","ANTHROPIC_AUTH_TOKEN":"old","ANTHROPIC_MODEL":"x","ANTHROPIC_DEFAULT_OPUS_MODEL_NAME":"x","CLAUDE_CODE_EFFORT_LEVEL":"max"}}', [Text.UTF8Encoding]::new($false))
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.3[1M]', 'glm-5.4[1M]'); default_version = 'glm-5.3[1M]' } }
+        accounts = @()
+    }
+    $ansFile = Join-Path $testHome 'answers.txt'
+    [IO.File]::WriteAllLines($ansFile, @('GLM-A', 'bigmodel', 'http://127.0.0.1:1/api', 'tk', '2'), [Text.UTF8Encoding]::new($false))
+    $outE = Join-Path $testHome 'e.out'; $errE = Join-Path $testHome 'e.err'
+    $pE = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ccx, 'add') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outE -RedirectStandardError $errE -RedirectStandardInput $ansFile
+    $txtE = Get-Content $outE -Raw -Encoding UTF8
+    Assert-Equal 0 $pE.ExitCode 'add 向导跑完'
+    Assert-True ($txtE.Contains('该组可选版本')) 'add 打印可选版本列表'
+    Assert-True ($txtE.Contains('glm-5.3[1M]（默认）')) 'add 列表默认标注'
+    $regE = Read-CcxJson -Path (Join-Path $testHome 'registry.json')
+    $newAcc = @($regE['accounts'] | Where-Object { $_['id'] -eq 'bigmodel-1' })
+    Assert-Equal 1 @($newAcc).Count '新号 bigmodel-1 落盘'
+    Assert-Equal 'glm-5.4[1M]' $newAcc[0]['env']['ANTHROPIC_MODEL'] '编号 2 解析为 glm-5.4[1M]'
+    Assert-Equal 'glm-5.4' $newAcc[0]['env']['ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'] 'add _NAME=基名'
+    Assert-Equal 'tk' $newAcc[0]['env']['ANTHROPIC_AUTH_TOKEN'] 'add token=输入值'
+
+    # ⑯ usage 首行文案（Show-CcxUsage 当前无调用方=纯文案钉住，防回退）
+    $usageTxt = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\bin\ccx.ps1'))
+    Assert-True ($usageTxt.Contains('交互选模型+版本并启动')) 'usage 首行含版本'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue

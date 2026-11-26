@@ -6,7 +6,7 @@ Import-Module (Join-Path $PSScriptRoot 'ccx-core.psm1') -Force
 function Show-CcxUsage {
     Write-Output 'ccx — Claude Code 号池启动器'
     Write-Output '用法:'
-    Write-Output '  ccx                       交互选模型并启动'
+    Write-Output '  ccx                       交互选模型+版本并启动'
     Write-Output '  ccx -c | ccx -r           续会话，重新自动选号'
     Write-Output '  ccx <model>[@<id>]        直启模型 / 强指号'
     Write-Output '  ccx <model> ... --no-check            跳过启动预检'
