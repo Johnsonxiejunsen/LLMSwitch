@@ -102,7 +102,7 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 {
   "schema": 1,
   "models": {
-    "glm": { "vendor": "bigmodel", "label": "智谱 GLM" }
+    "glm": { "vendor": "bigmodel", "label": "智谱 GLM", "versions": ["glm5.4[1M]", "glm-5.3[1M]"], "default_version": "glm5.4[1M]", "versions_include": "glm-5" }
   },
   "accounts": [
     {
@@ -131,6 +131,7 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 - `vendor` 相同 = 同厂商号池（自动切换只发生在池内）；`env` 块同厂商通常一致，仍**按号存**（为异构留口）
 - `reset_time`：当日额度恢复点（本地时刻，默认 `00:00`=次日零点），按号可配
 - `models`：模型别名 → 厂商组解析表（`ccx glm` / 交互选择器用；评审#3 裁定）；缺省时按 vendor 分组兜底。**首日实装与验证 = bigmodel 池**，schema 天然支持多厂商（后续 `ccx add` 即扩，零改码）
+- `versions`/`default_version`/`versions_include`（均可选，详 §13）：C 真相源——在线列表**实测不含 `[1M]` 变体**，变体只能手配；`default_version` 须为 `versions` 之一；`versions_include` 正则过滤在线发现（缺省 `.*`）
 
 **state.json**（schema 1）：
 ```json
@@ -179,8 +180,8 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 - 全部 mark → `ccx` → **面板「3 号全部不可用，最早恢复 glm-1 明日 00:00」** ✓
 
 **启动预检 preflight【已拍板：默认开，`--no-check` 可关】**（评审问题#1：号死了但用户忘 `mark` → `ccx -c` 会**原样选回刚死的号**，新窗口再死一遍，"自动切换"体感失灵）
-- 机制：选号后、启动前，对该号发 1 次最小请求（max_tokens≈1，用该号 env 的模型名）实测可用性
-- 失败分类（**保守，不误杀**）：`401` → 自动 mark blocked；**报文含 余额/欠费/insufficient/额度/exhaust → 自动 mark daily（先于 429 判定**：GLM 欠费/额度尽的实测形态=429+欠费报文，若按状态码先判会把欠费号误标 r429、60s 后反复死探）；**`429` → 自动 mark r429；未知错误 → 不标记**，警告后照常用该号启动（可能是本机网络问题，不能把号全杀）
+- 机制：选号后、启动前，对该号发 1 次最小请求（max_tokens≈1，用该号 env 的模型名**剥去尾部 `[..]` 标签后的基名**——与 Claude Code 客户端同构：CC 发请求前剥 `[1M]` 类标签，裸发带 `[1M]` 串实测必 400 [1211]，探针不同构会把好号误报死）实测可用性
+- 失败分类（**保守，不误杀**）：`401` → 自动 mark blocked；**报文含 余额/欠费/insufficient/额度/exhaust → 自动 mark daily（先于 429 判定**：GLM 欠费/额度尽的实测形态=429+欠费报文，若按状态码先判会把欠费号误标 r429、60s 后反复死探）；**报文含 模型不存在/model not found 类 → Fatal：明错终止、不标记不启动不接力（含强指路径）**——模型名配置错非号的状态，标记无意义，启动必死即吞业务失败；`ccx check` 面板渲染「模型不存在(配置错)」行不中断遍历；**`429` → 自动 mark r429；未知错误 → 不标记**，警告后照常用该号启动（可能是本机网络问题，不能把号全杀）
 - 标记后自动取下一号继续预检（上限=池大小）；全池预检失败 → 全池面板
 - 代价：每次开窗/续会话 **+0.5~2s**、1 次最小请求（token 成本≈0）；`--no-check` 可关
 - 多窗口并发下预检可能吃 429（另一窗口打满并发）→ 轻轮转到下一号，60s 自愈，无害
@@ -192,9 +193,9 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 
 | 命令 | 行为 |
 |---|---|
-| `ccx` | 交互选模型 → **自动选号** → 启动 claude（参数全透传） |
-| `ccx -c` / `ccx -r` | 续会话，重新走自动选号 |
-| `ccx <model>` | 按模型别名直启（如 `ccx glm` → bigmodel 组） |
+| `ccx` | 交互选模型（多组时）→ **交互选版本**（§13：组配了 versions 或在线有发现；唯一选项静默直用；回车=默认版）→ **自动选号** → 启动 claude（参数全透传） |
+| `ccx -c` / `ccx -r` | 续会话，重新走自动选号（多组时同样先选组；版本菜单同 §13，回车=默认） |
+| `ccx <model>` | 按模型别名直启（如 `ccx glm` → bigmodel 组；版本=`default_version` 直用不问，组未配则账号 env 原样） |
 | `ccx <model>@<id>` | 手动指定号（强指） |
 | `ccx list` | 全终端池状态面板 + **快照漂移提示**（settings.json 快照 ≠ registry 默认号时显示一行，防 cc-switch 手改漂移；评审#4 裁定：cc-switch 按退役处理，共存无害——ccx 路径不依赖快照） |
 | `ccx mark <id> <r429\|daily\|blocked>` | 标记受限（分层入 §5 状态机） |
@@ -262,3 +263,31 @@ settings.json 仅 set-default 显式改；值永远来自 registry（单一事�
 3. `ccx` 启动的窗口（**交互式**验证——P6/P7 已证 `-p` 模式测不了插件）：`/modelx` 显示正确当前号、插件/hooks/enabledPlugins 照常加载（若失载 → 启用"临时文件补 `enabledPlugins`"兜底并回归）；临时 settings 文件退出后无残留
 4. `mark daily` 后 `ccx -c` 换号成功，且旧窗口不受影响
 5. **卫生门**：仓内全量 grep 不到任何 token 片段；`~/.claude/model-accounts/` 不在仓内
+
+---
+
+## 13. 版本选择（组→版本二级菜单：C 真相源 ⊕ B 在线发现）
+
+> 2026-11-26 增量。前半需求（多窗口各用不同大模型）A期已支持——每窗口独立临时 settings 互不干扰，不重做；本节 = 版本**可选不手输**。
+
+```
+裸 ccx（交互、无 -p）                      ccx glm / @id 强指 / -p 非交互
+     │ 解析到组                                  │ 解析到组
+     ▼                                          ▼
+C versions 或 B 在线发现 非空？ ──否──► 无二级菜单（=A期行为，兜底）
+     │是（唯一选项→静默直用）                    │ 用 default_version 直用不问；
+     ▼                                          │ 组未配 default → 不覆盖（账号 env 原样）
+版本菜单（回车=默认版）→ 选中 → Merge-CcxEnv -Version 覆盖模型键 → 选号预检 → 启动
+
+C 手配：models.<key>.versions（配置序·默认版标注·含 [1M] 变体）
+B 发现：GET 首号 base_url + /v1/models（Bearer·4s 超时·失败静默只显 C·✚ 标注·归一化去重·永不写回）
+```
+
+- **归一化去重**：小写 + 去尾 `[..]` 变体 + 去非字母数字 → `glm5.4[1M]` ≡ `glm-5.4`（基 `glm54`）；在线 id 与 C 任一条同基 → 不追加
+- **env 覆盖规则**：仅动 `ANTHROPIC_*` 且含 `MODEL` 的键——`*_NAME` ← 基名（版本串去尾 `[..]`），其余 ← 版本串原样；并确保 `ANTHROPIC_MODEL` 至少写入（最小 env 号可用）；`BASE_URL`/`AUTH_TOKEN`/非模型键一律不动
+- **实测依据**（2026-11-26 双 vendor 探针）：bigmodel `/v1/models` 200 返 13 id（glm-4.5~glm-5.4，**无 [1M] 变体**）；freemodel 200 返 claude 系 id（**无 "claude code"**）→ B 只能当发现器，C 必须为根
+
+**验收（数值代入）**：
+- 组 glm：versions=[glm5.4[1M](默认), glm-5.3[1M]]，在线拉到 [glm-5.4, glm-5.3, glm-5.2, glm-4.5] → 菜单 4 项 = glm5.4[1M]←默认 / glm-5.3[1M] / ✚glm-5.2 / ✚glm-4.5（glm-5.4、glm-5.3 同基去重不追加）✓
+- 交互选 2 → 临时 settings `ANTHROPIC_MODEL=glm-5.3[1M]`、`*_MODEL_NAME=glm-5.3`，`ANTHROPIC_BASE_URL/AUTH_TOKEN` 原值 ✓
+- `ccx glm` 不问 → `ANTHROPIC_MODEL=glm5.4[1M]` ✓；组无 versions 且在线失败 → 无二级菜单照旧启动 ✓；在线失败但 C 有配置 → 菜单只显 C 无报错 ✓

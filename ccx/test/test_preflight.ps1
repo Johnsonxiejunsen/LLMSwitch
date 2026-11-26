@@ -102,6 +102,46 @@ try {
     $panel = Invoke-CcxCheck -Registry $reg2 -State (Read-CcxState) -Probe $probeCheck
     Assert-True ($panel -like '*c1*ok*') 'check 面板含 c1 ok'
     Assert-True ($panel -like '*c2*已停用*') 'check 面板含 c2 已停用'
+
+    # ⑧ Get-CcxProbeModel：剥尾 [..] 标签（与 CC 客户端同构——裸发 [1M] 串实测必 400 [1211]，探针不同构误报好号）
+    Assert-Equal 'glm-5.4' (Get-CcxProbeModel -Account @{ env = @{ ANTHROPIC_MODEL = 'glm-5.4[1M]' } }) '剥尾 [1M]'
+    Assert-Equal 'glm-5.3' (Get-CcxProbeModel -Account @{ env = @{ ANTHROPIC_MODEL = 'glm-5.3' } }) '无标签原样'
+    Assert-Equal 'claude-3-5-haiku-20241022' (Get-CcxProbeModel -Account @{ env = @{} }) '空 env → 兜底模型'
+
+    # ⑨ 400+模型不存在 → Fatal（分类层不 throw 不标记，策略归调用方）
+    $probeNoModel = { param($Account) @{ Status = 400; Body = '{"error":{"message":"[1211][模型不存在，请检查模型代码。]"}}'; NetworkError = $false } }
+    $r11 = Invoke-CcxPreflight -Account $acc2 -Probe $probeNoModel
+    Assert-Equal $false $r11['Ok'] '模型不存在 → Ok=false'
+    Assert-Equal $true $r11['Fatal'] '模型不存在 → Fatal=true'
+    Assert-True ($null -eq $r11['Marked']) '模型不存在不标记'
+    Assert-True ($null -eq (Read-CcxState)['accounts']['glm-2']) '模型不存在状态零落盘'
+
+    # ⑨' 英文报文同判（model not found / does not exist）
+    $probeNoModelEn = { param($Account) @{ Status = 404; Body = '{"error":{"type":"not_found_error","message":"model not found: glm5.4"}}'; NetworkError = $false } }
+    Assert-Equal $true (Invoke-CcxPreflight -Account $acc2 -Probe $probeNoModelEn)['Fatal'] 'model not found → Fatal'
+
+    # ⑨'' 无关键词的 400 → 仍走未知不标（兜底铁律回归：不能把未知错全杀）
+    $probe400Unknown = { param($Account) @{ Status = 400; Body = 'bad request something else'; NetworkError = $false } }
+    $r12 = Invoke-CcxPreflight -Account $acc2 -Probe $probe400Unknown
+    Assert-True ($null -eq $r12['Fatal']) '未知400 无 Fatal'
+    Assert-True ($null -eq $r12['Marked']) '未知400 不标记'
+
+    # ⑩ 轮转路径遇 Fatal → throw 明错不启动（不再"仍用该号启动"卖必死会话）
+    $stateG = @{ schema = 1; accounts = @{} }
+    Save-CcxState -State $stateG
+    Assert-Throws { Select-AndPreflight -Registry $reg -State (Read-CcxState) -Group $grp -Probe $probeNoModel } '轮转遇模型不存在明错' -Like '*模型不存在*'
+
+    # ⑩' 强指路径同判（配置错非"尊重选择"范畴：强指的号也起不来）
+    Assert-Throws { Select-AndPreflight -Registry $reg -State (Read-CcxState) -Group $grpG2 -StrongId 'glm-2' -Probe $probeNoModel } '强指遇模型不存在明错' -Like '*模型不存在*'
+
+    # ⑪ ccx check：Fatal 渲染配置错行，不中断全池遍历
+    $reg3 = @{ schema = 1; accounts = @(
+        @{ id = 'c3'; label = 'C3'; vendor = 'bigmodel'; enabled = $true; auth_token = 't'; env = @{} }
+        @{ id = 'c4'; label = 'C4'; vendor = 'bigmodel'; enabled = $true; auth_token = 't'; env = @{} }
+    ) }
+    $panel3 = Invoke-CcxCheck -Registry $reg3 -State (Read-CcxState) -Probe $probeNoModel
+    Assert-True ($panel3 -like '*c3*模型不存在*') 'check 面板 c3 配置错'
+    Assert-True ($panel3 -like '*c4*模型不存在*') 'check 面板 c4 配置错且未中断'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue

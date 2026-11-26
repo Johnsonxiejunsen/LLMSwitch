@@ -262,6 +262,16 @@ function Select-CcxAccount {
     return @{ Account = $chosen; Panel = ($lines -join "`n") }
 }
 
+function Get-CcxProbeModel {
+    # 探针模型名：env.ANTHROPIC_MODEL 剥尾 [..] 标签（与 Claude Code 客户端同构——
+    # CC 发请求前会剥 [1M] 类标签，裸发带 [1M] 串实测必 400 [1211]，探针不同构会把好号误报死）；空 → 兜底最小模型
+    param([Parameter(Mandatory = $true)][hashtable]$Account)
+    $model = $null
+    if ($Account['env'] -is [hashtable]) { $model = [string]$Account['env']['ANTHROPIC_MODEL'] }
+    if (-not $model) { return 'claude-3-5-haiku-20241022' }
+    return ($model -replace '\[[^\]]*\]\s*$', '')
+}
+
 function Invoke-CcxProbe {
     # 最小探针：POST <base_url>/v1/messages，max_tokens=1；-Probe 为测试注入口
     param([Parameter(Mandatory = $true)][hashtable]$Account, [scriptblock]$Probe)
@@ -273,8 +283,7 @@ function Invoke-CcxProbe {
         'Authorization'       = 'Bearer ' + $Account['auth_token']
         'anthropic-version'   = '2023-06-01'
     }
-    $model = $Account['env']['ANTHROPIC_MODEL']
-    if (-not $model) { $model = 'claude-3-5-haiku-20241022' }
+    $model = Get-CcxProbeModel -Account $Account
     $body = ConvertTo-Json -Depth 5 -InputObject @{
         model      = $model
         max_tokens = 1
@@ -315,6 +324,10 @@ function Invoke-CcxPreflight {
         Set-CcxAccountStatus -Id $Account['id'] -Status 'daily' -Note 'preflight 余额/欠费'
         return @{ Ok = $false; Marked = 'daily'; Detail = $body }
     }
+    if ($body -match '(?i)模型不存在|model[\s_-]*not[\s_-]*(found|exist)|model_not_found|does[\s_-]+not[\s_-]+exist|no[\s_-]+such[\s_-]+model|unknown[\s_-]+model|invalid[\s_-]+model') {
+        # 模型名配置错（非号的状态）：不标记（标记无意义）、由调用方明错不启动——2026-11-26 实跑 400 [1211] 定谳
+        return @{ Ok = $false; Marked = $null; Fatal = $true; Detail = ('模型不存在 HTTP ' + $status + ' ' + $body) }
+    }
     if ($status -eq 429) {
         Set-CcxAccountStatus -Id $Account['id'] -Status 'r429' -Note 'preflight 429'
         return @{ Ok = $false; Marked = 'r429'; Detail = ('HTTP 429 ' + $body) }
@@ -353,6 +366,9 @@ function Select-AndPreflight {
         Save-CcxState -State $State
         if (-not $NoCheck) {
             $pf = Invoke-CcxPreflight -Account $acc -Probe:$Probe
+            if ($pf['Fatal']) {
+                throw ('ccx: {0} {1}（模型名配置错，不标记不启动——强指也起不来）— 修 registry 该号 env 的模型键，或 ccx rm/ccx add 重配' -f $acc['id'], $pf['Detail'])
+            }
             if (-not $pf['Ok']) {
                 $warnings += ('{0} 预检失败：{1}（强指不接力，仍用该号启动）' -f $acc['id'], $pf['Detail'])
             }
@@ -368,6 +384,9 @@ function Select-AndPreflight {
         Save-CcxState -State $State
         if ($NoCheck) { return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] } }
         $pf = Invoke-CcxPreflight -Account $acc -Probe:$Probe
+        if ($pf['Fatal']) {
+            throw ('ccx: {0} {1}（模型名配置错，不标记不启动）— 修 registry 该号 env 的模型键，或 ccx rm/ccx add 重配' -f $acc['id'], $pf['Detail'])
+        }
         if ($pf['Ok']) { return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] } }
         if ($pf['Marked']) {
             $warnings += ('{0} 预检失败已标 {1}：{2}，换下一号' -f $acc['id'], $pf['Marked'], $pf['Detail'])
@@ -393,6 +412,7 @@ function Invoke-CcxCheck {
         }
         $pf = Invoke-CcxPreflight -Account $a -Probe:$Probe
         if ($pf['Ok']) { $txt = 'ok' }
+        elseif ($pf['Fatal']) { $txt = '模型不存在(配置错)' }
         elseif ($pf['Marked']) { $txt = '失败→已标 ' + $pf['Marked'] }
         else { $txt = '异常(未标)' }
         $lines.Add(('  {0,-8} {1,-10} {2}  {3}' -f $a['id'], $a['label'], $txt, $pf['Detail']))
