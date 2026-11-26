@@ -142,6 +142,22 @@ try {
     $panel3 = Invoke-CcxCheck -Registry $reg3 -State (Read-CcxState) -Probe $probeNoModel
     Assert-True ($panel3 -like '*c3*模型不存在*') 'check 面板 c3 配置错'
     Assert-True ($panel3 -like '*c4*模型不存在*') 'check 面板 c4 配置错且未中断'
+
+    # ⑫ 终审#1 Fatal 正则收紧：非模型类 does-not-exist / invalid model parameter 不得误伤
+    $probeEndpoint = { param($Account) @{ Status = 404; Body = 'endpoint does not exist'; NetworkError = $false } }
+    Assert-True ($null -eq (Invoke-CcxPreflight -Account $acc2 -Probe $probeEndpoint)['Fatal']) 'endpoint does not exist 不误伤'
+    $probeUser404 = { param($Account) @{ Status = 404; Body = 'user does not exist'; NetworkError = $false } }
+    Assert-True ($null -eq (Invoke-CcxPreflight -Account $acc2 -Probe $probeUser404)['Fatal']) 'user does not exist 不误伤'
+    $probeInvalidParam = { param($Account) @{ Status = 400; Body = 'invalid model parameter: temperature'; NetworkError = $false } }
+    $r13 = Invoke-CcxPreflight -Account $acc2 -Probe $probeInvalidParam
+    Assert-True ($null -eq $r13['Fatal']) 'invalid model parameter 不误伤'
+    Assert-True ($null -eq $r13['Marked']) '误伤面不误标'
+
+    # ⑫' 真阳性仍命中：OpenAI 风 "The model 'x' does not exist" / invalid model id
+    $probeOai = { param($Account) @{ Status = 404; Body = "The model 'gpt-x' does not exist or you do not have access to it."; NetworkError = $false } }
+    Assert-Equal $true (Invoke-CcxPreflight -Account $acc2 -Probe $probeOai)['Fatal'] "model 'x' does not exist → Fatal"
+    $probeInvalidId = { param($Account) @{ Status = 400; Body = 'invalid model id provided'; NetworkError = $false } }
+    Assert-Equal $true (Invoke-CcxPreflight -Account $acc2 -Probe $probeInvalidId)['Fatal'] 'invalid model id → Fatal'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue

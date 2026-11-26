@@ -194,7 +194,10 @@ function Get-CcxVersionOptions {
         }
     }
     $include = $null
-    if ($ModelNode -is [hashtable] -and $ModelNode['versions_include']) { $include = [string]$ModelNode['versions_include'] }
+    if ($ModelNode -is [hashtable] -and $ModelNode['versions_include']) {
+        $include = [string]$ModelNode['versions_include']
+        try { [void][regex]::IsMatch('', $include) } catch { $include = $null }   # 非法正则失效当无过滤（终审#4）
+    }
     foreach ($f in @($Fetched)) {
         $id = [string]$f
         if (-not $id) { continue }
@@ -217,7 +220,7 @@ function Resolve-CcxVersionInput {
         if ($def.Count -ge 1) { return [string]$def[0]['Id'] }
         throw '无效版本选择：该组未配 default_version，请输入编号或列表中的全名'
     }
-    if ($c -match '^[1-9][0-9]*$') {
+    if ($c -match '^[1-9][0-9]*$' -and $c.Length -le 9) {
         $i = [int]$c - 1
         if ($i -ge 0 -and $i -lt $opts.Count) { return [string]$opts[$i]['Id'] }
         throw ('无效版本选择：编号 ' + $c + ' 超出范围（1-' + $opts.Count + '）')
@@ -368,19 +371,23 @@ function Select-CcxAccount {
 }
 
 function Get-CcxProbeModel {
-    # 探针模型名：env.ANTHROPIC_MODEL 剥尾 [..] 标签（与 Claude Code 客户端同构——
-    # CC 发请求前会剥 [1M] 类标签，裸发带 [1M] 串实测必 400 [1211]，探针不同构会把好号误报死）；空 → 兜底最小模型
-    param([Parameter(Mandatory = $true)][hashtable]$Account)
-    $model = $null
-    if ($Account['env'] -is [hashtable]) { $model = [string]$Account['env']['ANTHROPIC_MODEL'] }
+    # 探针模型名：-Override（选中版本）优先，回落 env.ANTHROPIC_MODEL，再回落兜底最小模型；
+    # 一律剥尾 [..] 标签（与 Claude Code 客户端同构——CC 发请求前剥 [1M] 类标签，裸发带 [1M] 串实测必 400 [1211]，
+    # 探针不同构会把好号误报死）
+    param([Parameter(Mandatory = $true)][hashtable]$Account, [string]$Override)
+    $model = [string]$Override
+    if (-not $model -and $Account['env'] -is [hashtable]) { $model = [string]$Account['env']['ANTHROPIC_MODEL'] }
     if (-not $model) { return 'claude-3-5-haiku-20241022' }
     return ($model -replace '\[[^\]]*\]\s*$', '')
 }
 
 function Invoke-CcxProbe {
-    # 最小探针：POST <base_url>/v1/messages，max_tokens=1；-Probe 为测试注入口
-    param([Parameter(Mandatory = $true)][hashtable]$Account, [scriptblock]$Probe)
-    if ($Probe) { return (& $Probe -Account $Account) }
+    # 最小探针：POST <base_url>/v1/messages，max_tokens=1；-Probe 为测试注入口（有 -Model 时缝收 -Model=剥后实际发送名）
+    param([Parameter(Mandatory = $true)][hashtable]$Account, [string]$Model, [scriptblock]$Probe)
+    if ($Probe) {
+        if ($Model) { return (& $Probe -Account $Account -Model (Get-CcxProbeModel -Account $Account -Override $Model)) }
+        return (& $Probe -Account $Account)
+    }
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $uri = ([string]$Account['base_url']).TrimEnd('/') + '/v1/messages'
@@ -388,7 +395,7 @@ function Invoke-CcxProbe {
         'Authorization'       = 'Bearer ' + $Account['auth_token']
         'anthropic-version'   = '2023-06-01'
     }
-    $model = Get-CcxProbeModel -Account $Account
+    $model = Get-CcxProbeModel -Account $Account -Override $Model
     $body = ConvertTo-Json -Depth 5 -InputObject @{
         model      = $model
         max_tokens = 1
@@ -413,9 +420,10 @@ function Invoke-CcxProbe {
 }
 
 function Invoke-CcxPreflight {
-    # 分类顺序（保守，不误杀）：401→blocked → Body 余额/欠费→daily → 429→r429 → 其余不标只警告
-    param([Parameter(Mandatory = $true)][hashtable]$Account, [scriptblock]$Probe)
-    $r = Invoke-CcxProbe -Account $Account -Probe:$Probe
+    # 分类顺序（保守，不误杀）：401→blocked → Body 余额/欠费→daily → 模型不存在→Fatal → 429→r429 → 其余不标只警告
+    # -Model=选中版本（终审#2：探针测将启动的模型而非 env 旧值）
+    param([Parameter(Mandatory = $true)][hashtable]$Account, [string]$Model, [scriptblock]$Probe)
+    $r = Invoke-CcxProbe -Account $Account -Model $Model -Probe:$Probe
     $status = [int]$r['Status']
     $body = [string]$r['Body']
     if ($body.Length -gt 120) { $body = $body.Substring(0, 120) + '…' }
@@ -429,7 +437,7 @@ function Invoke-CcxPreflight {
         Set-CcxAccountStatus -Id $Account['id'] -Status 'daily' -Note 'preflight 余额/欠费'
         return @{ Ok = $false; Marked = 'daily'; Detail = $body }
     }
-    if ($body -match '(?i)模型不存在|model[\s_-]*not[\s_-]*(found|exist)|model_not_found|does[\s_-]+not[\s_-]+exist|no[\s_-]+such[\s_-]+model|unknown[\s_-]+model|invalid[\s_-]+model') {
+    if ($body -match '(?i)模型不存在|model[\s_-]*not[\s_-]*(found|exist)|model[^.\r\n]{0,40}does[\s_-]+not[\s_-]+exist|no[\s_-]+such[\s_-]+model|unknown[\s_-]+model|invalid[\s_-]+model[\s_-]?(id|name|code)|invalid_model') {
         # 模型名配置错（非号的状态）：不标记（标记无意义）、由调用方明错不启动——2026-11-26 实跑 400 [1211] 定谳
         return @{ Ok = $false; Marked = $null; Fatal = $true; Detail = ('模型不存在 HTTP ' + $status + ' ' + $body) }
     }
@@ -452,6 +460,7 @@ function Select-AndPreflight {
         [Parameter(Mandatory = $true)][AllowNull()][hashtable]$Group,
         [switch]$NoCheck,
         [string]$StrongId,
+        [string]$Model,
         [scriptblock]$Probe,
         [datetime]$Now = (Get-Date)
     )
@@ -470,9 +479,9 @@ function Select-AndPreflight {
         if ($eff -ne 'ok') { $warnings += ('{0} 当前状态 {1}（强指尊重选择）' -f $acc['id'], $eff) }
         Save-CcxState -State $State
         if (-not $NoCheck) {
-            $pf = Invoke-CcxPreflight -Account $acc -Probe:$Probe
+            $pf = Invoke-CcxPreflight -Account $acc -Model $Model -Probe:$Probe
             if ($pf['Fatal']) {
-                throw ('ccx: {0} {1}（模型名配置错，不标记不启动——强指也起不来）— 修 registry 该号 env 的模型键，或 ccx rm/ccx add 重配' -f $acc['id'], $pf['Detail'])
+                throw ('{0} {1}（模型名配置错，不标记不启动——强指也起不来）— 修 registry 该号 env 的模型键，或 ccx rm/ccx add 重配' -f $acc['id'], $pf['Detail'])
             }
             if (-not $pf['Ok']) {
                 $warnings += ('{0} 预检失败：{1}（强指不接力，仍用该号启动）' -f $acc['id'], $pf['Detail'])
@@ -488,9 +497,9 @@ function Select-AndPreflight {
         $acc = $sel['Account']
         Save-CcxState -State $State
         if ($NoCheck) { return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] } }
-        $pf = Invoke-CcxPreflight -Account $acc -Probe:$Probe
+        $pf = Invoke-CcxPreflight -Account $acc -Model $Model -Probe:$Probe
         if ($pf['Fatal']) {
-            throw ('ccx: {0} {1}（模型名配置错，不标记不启动）— 修 registry 该号 env 的模型键，或 ccx rm/ccx add 重配' -f $acc['id'], $pf['Detail'])
+            throw ('{0} {1}（模型名配置错，不标记不启动）— 修 registry 该号 env 的模型键，或 ccx rm/ccx add 重配' -f $acc['id'], $pf['Detail'])
         }
         if ($pf['Ok']) { return @{ Account = $acc; Warnings = $warnings; Panel = $sel['Panel'] } }
         if ($pf['Marked']) {
@@ -855,45 +864,50 @@ function Invoke-CcxLaunch {
         }
     }
 
+    # §13 版本选择【先于选号预检】（终审#2：探针必须测将启动的模型，顺序颠倒会在本功能主场景卖死会话/堵死菜单）：
+    # 交互（无别名/强指且非 -p/--print）→ C⊕B 菜单（唯一选项静默直用；回车=默认版；未配默认又回车 → 不覆盖原样=兜底）；
+    # 别名/强指/-p 快路径 → default_version 直用不问；options 空 → 不覆盖（A期原样）。
+    # B 发现用组首号 base_url/token（spec §13），失败静默空、永不写回 registry
+    $version = $null
+    $interactive = (-not $ModelSpec) -and (-not (@($Passthrough) -contains '-p')) -and (-not (@($Passthrough) -contains '--print'))
+    if ($grp -and @($grp['Accounts']).Count -gt 0) {
+        # 全停用组 grp=null → 跳过版本逻辑，Select-AndPreflight 出友好面板（A期不变）
+        $modelNode = Get-CcxModelNode -Registry $reg -Vendor ([string]$grp['Vendor'])
+        if ($interactive) {
+            $firstAcc = @($grp['Accounts'])[0]
+            $fetched = Get-CcxRemoteVersions -Account $firstAcc
+            $options = @(Get-CcxVersionOptions -ModelNode $modelNode -Fetched $fetched)
+            if ($options.Count -eq 1) {
+                $version = [string]$options[0]['Id']
+            } elseif ($options.Count -gt 1) {
+                Write-Output '选择版本:'
+                for ($i = 0; $i -lt $options.Count; $i++) {
+                    $marks = ''
+                    if ($options[$i]['IsDefault']) { $marks += '（默认）' }
+                    if ($options[$i]['Source'] -eq 'remote') { $marks += ' ✚' }
+                    Write-Output ('  ' + ($i + 1) + '. ' + $options[$i]['Id'] + $marks)
+                }
+                $choice = [string](Read-Host '输入编号或全名（回车=默认）')
+                $hasDefault = @($options | Where-Object { $_['IsDefault'] }).Count -gt 0
+                if ([string]::IsNullOrWhiteSpace($choice) -and -not $hasDefault) {
+                    Write-Output 'ccx: 未配 default_version，回车=按账号 env 原样启动'
+                } else {
+                    $version = Resolve-CcxVersionInput -Choice $choice -Options $options
+                }
+            }
+        } elseif ($modelNode -and $modelNode['default_version']) {
+            $version = [string]$modelNode['default_version']
+        }
+    }
+
     $state = Read-CcxState
-    $r = Select-AndPreflight -Registry $reg -State $state -Group $grp -NoCheck:$NoCheck -StrongId $strongId -Probe $Probe
+    $r = Select-AndPreflight -Registry $reg -State $state -Group $grp -NoCheck:$NoCheck -StrongId $strongId -Model $version -Probe $Probe
     foreach ($w in @($r['Warnings'])) { Write-Output ('⚠ ' + $w) }
     if ($null -eq $r['Account']) {
         Write-Output $r['Panel']
         exit 1
     }
     $acc = $r['Account']
-
-    # §13 版本选择：交互（无别名/强指且非 -p/--print）→ C⊕B 菜单（唯一选项静默直用；回车=默认版；
-    # 未配默认又回车 → 不覆盖原样=兜底）；别名/强指/-p 快路径 → default_version 直用不问；
-    # options 空 → 不覆盖（A期原样）。B 发现用选中号的 base_url/token，失败静默空、永不写回 registry
-    $version = $null
-    $interactive = (-not $ModelSpec) -and (-not (@($Passthrough) -contains '-p')) -and (-not (@($Passthrough) -contains '--print'))
-    $modelNode = Get-CcxModelNode -Registry $reg -Vendor ([string]$acc['vendor'])
-    if ($interactive) {
-        $fetched = Get-CcxRemoteVersions -Account $acc
-        $options = @(Get-CcxVersionOptions -ModelNode $modelNode -Fetched $fetched)
-        if ($options.Count -eq 1) {
-            $version = [string]$options[0]['Id']
-        } elseif ($options.Count -gt 1) {
-            Write-Output '选择版本:'
-            for ($i = 0; $i -lt $options.Count; $i++) {
-                $marks = ''
-                if ($options[$i]['IsDefault']) { $marks += '（默认）' }
-                if ($options[$i]['Source'] -eq 'remote') { $marks += ' ✚' }
-                Write-Output ('  ' + ($i + 1) + '. ' + $options[$i]['Id'] + $marks)
-            }
-            $choice = [string](Read-Host '输入编号或全名（回车=默认）')
-            $hasDefault = @($options | Where-Object { $_['IsDefault'] }).Count -gt 0
-            if ([string]::IsNullOrWhiteSpace($choice) -and -not $hasDefault) {
-                Write-Output 'ccx: 未配 default_version，回车=按账号 env 原样启动'
-            } else {
-                $version = Resolve-CcxVersionInput -Choice $choice -Options $options
-            }
-        }
-    } elseif ($modelNode -and $modelNode['default_version']) {
-        $version = [string]$modelNode['default_version']
-    }
 
     $passthroughTxt = ''
     if (@($Passthrough).Count -gt 0) { $passthroughTxt = ' ' + (@($Passthrough) -join ' ') }

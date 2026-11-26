@@ -212,6 +212,48 @@ try {
     Assert-Equal 'glm-5.3[1M]' (Get-CcxModelNode -Registry $regDup -Vendor 'bigmodel')['default_version'] '双节点优先带 versions'
     $regBare = @{ models = @{ bigmodel = @{ vendor = 'bigmodel'; label = 'bigmodel' } } }
     Assert-Equal 'bigmodel' (Get-CcxModelNode -Registry $regBare -Vendor 'bigmodel')['label'] '仅裸节点兜底返回'
+
+    # ⑱ Get-CcxProbeModel -Override（终审#2）：选中版本优先于 env 模型，探针测将启动的模型
+    Assert-Equal 'glm-5.4' (Get-CcxProbeModel -Account @{ env = @{ ANTHROPIC_MODEL = 'glm-5.3' } } -Override 'glm-5.4[1M]') '覆盖版剥标签'
+    Assert-Equal 'glm-5.3' (Get-CcxProbeModel -Account @{ env = @{ ANTHROPIC_MODEL = 'glm-5.3' } } -Override '') '空覆盖回落 env'
+    Assert-Equal 'claude-3-5-haiku-20241022' (Get-CcxProbeModel -Account @{ env = @{} } -Override $null) 'null 覆盖回落兜底'
+
+    # ⑲ 版本选择先于预检（§13 顺序）：env 模型为垃圾但唯一选项有效 → 探针缝看到选中版而非 env，照启
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.2'); default_version = 'glm-5.2' } }
+        accounts = @(
+            @{ id = 'glm-1'; label = '智谱1'; vendor = 'bigmodel'; priority = 1; enabled = $true; base_url = 'http://127.0.0.1:1/api'; auth_token = 't1'; env = @{ ANTHROPIC_MODEL = 'claude code'; ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = 'claude code' } }
+        )
+    }
+    Remove-Item (Join-Path $testHome 'state.json') -ErrorAction SilentlyContinue
+    Remove-Item $env:CCX_FAKE_SNAPSHOT -ErrorAction SilentlyContinue
+    $script:seenModel = $null
+    $seamVer = { param($Account, $Model) $script:seenModel = $Model; if ($Model -eq 'glm-5.2') { @{ Status = 200; Body = 'ok'; NetworkError = $false } } else { @{ Status = 400; Body = '[1211][模型不存在，请检查模型代码。]'; NetworkError = $false } } }
+    Invoke-CcxLaunch -ModelSpec '' -Passthrough @() -Probe $seamVer
+    Assert-Equal 'glm-5.2' $script:seenModel '预检缝看到选中版本（非 env 垃圾）'
+    $snapE = Read-CcxJson -Path $env:CCX_FAKE_SNAPSHOT
+    Assert-Equal 'glm-5.2' $snapE['env']['ANTHROPIC_MODEL'] '⑲ 快照=选中版本'
+
+    # ⑳ 快路径同律：别名直启 → 预检缝看到 default_version（剥标签），非 env 模型
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.3[1M]', 'glm-5.4[1M]'); default_version = 'glm-5.4[1M]' } }
+        accounts = @(
+            @{ id = 'glm-1'; label = '智谱1'; vendor = 'bigmodel'; priority = 1; enabled = $true; base_url = 'http://127.0.0.1:1/api'; auth_token = 't1'; env = @{ ANTHROPIC_MODEL = 'glm-5.3[1M]' } }
+        )
+    }
+    $script:seenFast = $null
+    $seamFast = { param($Account, $Model) $script:seenFast = $Model; @{ Status = 200; Body = 'ok'; NetworkError = $false } }
+    Invoke-CcxLaunch -ModelSpec 'glm' -Passthrough @() -Probe $seamFast
+    Assert-Equal 'glm-5.4' $script:seenFast '快路径预检=默认版(剥标签)'
+
+    # ㉑ versions_include 非法正则 → 失效当无过滤全显，不炸（终审#4）
+    $nodeBad = @{ versions = @('a1'); versions_include = 'glm([1M' }
+    Assert-Equal 3 @(Get-CcxVersionOptions -ModelNode $nodeBad -Fetched @('b2', 'c3')).Count '非法 include 当无过滤'
+
+    # ㉒ 超长数字输入 → 走全名未中明错，不 Int32 溢出（终审#5）
+    Assert-Throws { Resolve-CcxVersionInput -Choice '99999999999999999999' -Options $opts } '超长数字明错不溢出' -Like '*无效版本*'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue
