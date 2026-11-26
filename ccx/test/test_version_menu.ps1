@@ -106,6 +106,80 @@ try {
     Assert-Equal 'v1' (Get-CcxModelNode -Registry $reg -Vendor 'bigmodel')['versions'][0] '命中 bigmodel 节'
     Assert-True ($null -eq (Get-CcxModelNode -Registry @{ models = @{} } -Vendor 'bigmodel')) '未配返回 null'
     Assert-True ($null -eq (Get-CcxModelNode -Registry @{ } -Vendor 'bigmodel')) '无 models 节返回 null'
+
+    # ⑪ 启动接线（子进程）：单 vendor + versions 多项 + -NonInteractive → 版本菜单渲染、默认标注、退 1
+    $env:CCX_FAKE_LOG = Join-Path $testHome 'fake-log.txt'
+    $env:CCX_FAKE_SNAPSHOT = Join-Path $testHome 'fake-snapshot.json'
+    $env:CCX_CLAUDE_CMD = Join-Path $PSScriptRoot 'fake_claude.ps1'
+    $ccx = Join-Path $PSScriptRoot '..\bin\ccx.ps1'
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.3[1M]', 'glm-5.4[1M]'); default_version = 'glm-5.3[1M]' } }
+        accounts = @(
+            @{ id = 'glm-1'; label = '智谱1'; vendor = 'bigmodel'; priority = 1; enabled = $true; base_url = 'http://127.0.0.1:1/api'; auth_token = 't1'; env = @{ ANTHROPIC_MODEL = 'glm-5.3[1M]'; ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = 'glm-5.3' } }
+        )
+    }
+    $outA = Join-Path $testHome 'a.out'; $errA = Join-Path $testHome 'a.err'
+    $pA = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ccx) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outA -RedirectStandardError $errA
+    $txtA = Get-Content $outA -Raw -Encoding UTF8
+    Assert-True ($txtA -like '*选择版本*') '版本菜单渲染'
+    Assert-True ($txtA.Contains('glm-5.3[1M]（默认）')) '默认版标注（字面含 [1M]，-like 会当字符类）'
+    Assert-True ($txtA.Contains('glm-5.4[1M]')) '第二项在列'
+    Assert-Equal 1 $pA.ExitCode 'NonInteractive Read-Host 抛错退 1'
+
+    # ⑫ 唯一选项 → 静默直用（无菜单），快照=该版本
+    Remove-Item $env:CCX_FAKE_LOG, $env:CCX_FAKE_SNAPSHOT -ErrorAction SilentlyContinue
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.2') } }
+        accounts = @(
+            @{ id = 'glm-1'; label = '智谱1'; vendor = 'bigmodel'; priority = 1; enabled = $true; base_url = 'http://127.0.0.1:1/api'; auth_token = 't1'; env = @{ ANTHROPIC_MODEL = 'glm-5.3[1M]'; ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = 'glm-5.3' } }
+        )
+    }
+    $outB = Join-Path $testHome 'b.out'; $errB = Join-Path $testHome 'b.err'
+    $pB = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ccx) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outB -RedirectStandardError $errB
+    $txtB = Get-Content $outB -Raw -Encoding UTF8
+    Assert-Equal 0 $pB.ExitCode '唯一选项静默启动'
+    Assert-True ($txtB -notlike '*选择版本*') '唯一选项无菜单'
+    Assert-True (Test-Path $env:CCX_FAKE_SNAPSHOT) 'fake 快照存在'
+    $snapB = Read-CcxJson -Path $env:CCX_FAKE_SNAPSHOT
+    Assert-Equal 'glm-5.2' $snapB['env']['ANTHROPIC_MODEL'] '唯一选项覆盖主键'
+    Assert-Equal 'glm-5.2' $snapB['env']['ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'] '唯一选项 _NAME=基名'
+
+    # ⑬ 别名快路径：ccx glm → default_version 直用不问
+    Remove-Item $env:CCX_FAKE_LOG, $env:CCX_FAKE_SNAPSHOT -ErrorAction SilentlyContinue
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.3[1M]', 'glm-5.4[1M]'); default_version = 'glm-5.4[1M]' } }
+        accounts = @(
+            @{ id = 'glm-1'; label = '智谱1'; vendor = 'bigmodel'; priority = 1; enabled = $true; base_url = 'http://127.0.0.1:1/api'; auth_token = 't1'; env = @{ ANTHROPIC_MODEL = 'glm-5.3[1M]'; ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = 'glm-5.3' } }
+        )
+    }
+    $outC = Join-Path $testHome 'c.out'; $errC = Join-Path $testHome 'c.err'
+    $pC = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ccx, 'glm') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outC -RedirectStandardError $errC
+    $txtC = Get-Content $outC -Raw -Encoding UTF8
+    Assert-Equal 0 $pC.ExitCode '别名快路径启动'
+    Assert-True ($txtC -notlike '*选择版本*') '快路径无菜单'
+    $snapC = Read-CcxJson -Path $env:CCX_FAKE_SNAPSHOT
+    Assert-Equal 'glm-5.4[1M]' $snapC['env']['ANTHROPIC_MODEL'] '快路径=默认版'
+    Assert-Equal 'glm-5.4' $snapC['env']['ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'] '快路径 _NAME=基名'
+
+    # ⑭ 无 versions 组（fetch 秒拒空）→ 无菜单照启，快照=账号 env 原样（A期回归）
+    Remove-Item $env:CCX_FAKE_LOG, $env:CCX_FAKE_SNAPSHOT -ErrorAction SilentlyContinue
+    Save-CcxJson -Path (Join-Path $testHome 'registry.json') -Data @{
+        schema   = 1
+        models   = @{ glm = @{ vendor = 'bigmodel'; label = '智谱 GLM' } }
+        accounts = @(
+            @{ id = 'glm-1'; label = '智谱1'; vendor = 'bigmodel'; priority = 1; enabled = $true; base_url = 'http://127.0.0.1:1/api'; auth_token = 't1'; env = @{ ANTHROPIC_MODEL = 'glm-4.6' } }
+        )
+    }
+    $outD = Join-Path $testHome 'd.out'; $errD = Join-Path $testHome 'd.err'
+    $pD = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ccx) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $outD -RedirectStandardError $errD
+    $txtD = Get-Content $outD -Raw -Encoding UTF8
+    Assert-Equal 0 $pD.ExitCode '无版本配置照启'
+    Assert-True ($txtD -notlike '*选择版本*') '无配置无菜单'
+    $snapD = Read-CcxJson -Path $env:CCX_FAKE_SNAPSHOT
+    Assert-Equal 'glm-4.6' $snapD['env']['ANTHROPIC_MODEL'] '无配置不覆盖（A期原样）'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue

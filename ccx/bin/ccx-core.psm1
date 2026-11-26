@@ -832,11 +832,45 @@ function Invoke-CcxLaunch {
         exit 1
     }
     $acc = $r['Account']
+
+    # §13 版本选择：交互（无别名/强指且非 -p/--print）→ C⊕B 菜单（唯一选项静默直用；回车=默认版；
+    # 未配默认又回车 → 不覆盖原样=兜底）；别名/强指/-p 快路径 → default_version 直用不问；
+    # options 空 → 不覆盖（A期原样）。B 发现用选中号的 base_url/token，失败静默空、永不写回 registry
+    $version = $null
+    $interactive = (-not $ModelSpec) -and (-not (@($Passthrough) -contains '-p')) -and (-not (@($Passthrough) -contains '--print'))
+    $modelNode = Get-CcxModelNode -Registry $reg -Vendor ([string]$acc['vendor'])
+    if ($interactive) {
+        $fetched = Get-CcxRemoteVersions -Account $acc
+        $options = @(Get-CcxVersionOptions -ModelNode $modelNode -Fetched $fetched)
+        if ($options.Count -eq 1) {
+            $version = [string]$options[0]['Id']
+        } elseif ($options.Count -gt 1) {
+            Write-Output '选择版本:'
+            for ($i = 0; $i -lt $options.Count; $i++) {
+                $marks = ''
+                if ($options[$i]['IsDefault']) { $marks += '（默认）' }
+                if ($options[$i]['Source'] -eq 'remote') { $marks += ' ✚' }
+                Write-Output ('  ' + ($i + 1) + '. ' + $options[$i]['Id'] + $marks)
+            }
+            $choice = [string](Read-Host '输入编号或全名（回车=默认）')
+            $hasDefault = @($options | Where-Object { $_['IsDefault'] }).Count -gt 0
+            if ([string]::IsNullOrWhiteSpace($choice) -and -not $hasDefault) {
+                Write-Output 'ccx: 未配 default_version，回车=按账号 env 原样启动'
+            } else {
+                $version = Resolve-CcxVersionInput -Choice $choice -Options $options
+            }
+        }
+    } elseif ($modelNode -and $modelNode['default_version']) {
+        $version = [string]$modelNode['default_version']
+    }
+
     $passthroughTxt = ''
     if (@($Passthrough).Count -gt 0) { $passthroughTxt = ' ' + (@($Passthrough) -join ' ') }
-    Write-Output ('ccx: 启动 ' + $acc['label'] + '（' + $acc['id'] + '）' + $passthroughTxt)
+    $verTxt = ''
+    if ($version) { $verTxt = ' @ ' + $version }
+    Write-Output ('ccx: 启动 ' + $acc['label'] + '（' + $acc['id'] + '）' + $verTxt + $passthroughTxt)
 
-    $env2 = Merge-CcxEnv -Account $acc
+    $env2 = Merge-CcxEnv -Account $acc -Version:$version
     $tmp = Write-CcxTempSettings -Env $env2
     $claudeCmd = 'claude'
     if ($env:CCX_CLAUDE_CMD) { $claudeCmd = $env:CCX_CLAUDE_CMD }
