@@ -256,14 +256,19 @@ function Get-CcxRemoteVersions {
 }
 
 function Get-CcxModelNode {
-    # §13 models 别名节按 vendor 命中（一 vendor 一节点）；未配/无 models 节 → $null
+    # §13 models 别名节按 vendor 命中；同 vendor 多节点（旧裸别名+versions 节并存，活 registry 实测形态）
+    # → 优先带 versions/default_version 者，裸节点兜底；未配/无 models 节 → $null
     param([AllowNull()]$Registry, [Parameter(Mandatory = $true)][string]$Vendor)
     if (-not $Registry -or -not $Registry['models']) { return $null }
+    $fallback = $null
     foreach ($k in @($Registry['models'].Keys)) {
         $node = $Registry['models'][$k]
-        if ($node -is [hashtable] -and [string]$node['vendor'] -eq $Vendor) { return $node }
+        if ($node -is [hashtable] -and [string]$node['vendor'] -eq $Vendor) {
+            if ($node['versions'] -or $node['default_version']) { return $node }
+            if (-not $fallback) { $fallback = $node }
+        }
     }
-    return $null
+    return $fallback
 }
 
 function Format-CcxUntil {
@@ -829,7 +834,16 @@ function Invoke-CcxLaunch {
                     if ($g) { $cnt = @($g['Accounts']).Count }
                     $lbl = $vendors[$i]
                     if ($reg['models'] -is [hashtable]) {
-                        foreach ($k in @($reg['models'].Keys)) { if ($reg['models'][$k]['vendor'] -eq $vendors[$i]) { $lbl = $reg['models'][$k]['label']; break } }
+                        # 同 vendor 双节点同律：优先带 versions 者（与 Get-CcxModelNode 一致），label 空则保留 vendor 名
+                        $lblNode = $null
+                        foreach ($k in @($reg['models'].Keys)) {
+                            $mn = $reg['models'][$k]
+                            if ($mn -is [hashtable] -and [string]$mn['vendor'] -eq $vendors[$i]) {
+                                if ($mn['versions'] -or $mn['default_version']) { $lblNode = $mn; break }
+                                if (-not $lblNode) { $lblNode = $mn }
+                            }
+                        }
+                        if ($lblNode -and $lblNode['label']) { $lbl = $lblNode['label'] }
                     }
                     Write-Output ('  ' + ($i + 1) + '. ' + $lbl + '（' + $vendors[$i] + '，' + $cnt + ' 个号）')
                 }

@@ -206,6 +206,12 @@ try {
     # ⑯ usage 首行文案（Show-CcxUsage 当前无调用方=纯文案钉住，防回退）
     $usageTxt = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\bin\ccx.ps1'))
     Assert-True ($usageTxt.Contains('交互选模型+版本并启动')) 'usage 首行含版本'
+
+    # ⑰ 同 vendor 双 models 节（旧裸别名 + versions 节并存，活 registry 实测形态）→ 命中带 versions 者；仅裸节点兜底返回
+    $regDup = @{ models = @{ bigmodel = @{ vendor = 'bigmodel'; label = 'bigmodel' }; glm = @{ vendor = 'bigmodel'; label = '智谱 GLM'; versions = @('glm-5.3[1M]'); default_version = 'glm-5.3[1M]' } } }
+    Assert-Equal 'glm-5.3[1M]' (Get-CcxModelNode -Registry $regDup -Vendor 'bigmodel')['default_version'] '双节点优先带 versions'
+    $regBare = @{ models = @{ bigmodel = @{ vendor = 'bigmodel'; label = 'bigmodel' } } }
+    Assert-Equal 'bigmodel' (Get-CcxModelNode -Registry $regBare -Vendor 'bigmodel')['label'] '仅裸节点兜底返回'
 } finally {
     Remove-Item -Recurse -Force $testHome -ErrorAction SilentlyContinue
     Remove-Module ccx-core -ErrorAction SilentlyContinue
