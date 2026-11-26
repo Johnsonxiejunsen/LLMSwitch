@@ -1,6 +1,6 @@
 # ccx — Claude Code 号池启动器（A期：开窗/续会话切换）
 
-> 状态: **v1.0 待用户确认（七探测定谳；评审 3 裁定 + preflight 拍板默认开，均已回填）** · 2026-11-25 · 域: ccx
+> 状态: **A期 + §13 已实施（分支 feat/ccx-versions）· §14 待用户确认** · 2026-11-26 · 域: ccx
 > 变更历史: 见 `specs/archive/ccx-changelog.md`（立项起逐次追加）
 
 ---
@@ -104,6 +104,7 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
   "models": {
     "glm": { "vendor": "bigmodel", "label": "智谱 GLM", "versions": ["glm5.4[1M]", "glm-5.3[1M]"], "default_version": "glm5.4[1M]", "versions_include": "glm-5" }
   },
+  "permission_mode": "bypassPermissions",
   "accounts": [
     {
       "id": "glm-1",
@@ -132,6 +133,7 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 - `reset_time`：当日额度恢复点（本地时刻，默认 `00:00`=次日零点），按号可配
 - `models`：模型别名 → 厂商组解析表（`ccx glm` / 交互选择器用；评审#3 裁定）；缺省时按 vendor 分组兜底。**首日实装与验证 = bigmodel 池**，schema 天然支持多厂商（后续 `ccx add` 即扩，零改码）
 - `versions`/`default_version`/`versions_include`（均可选，详 §13）：C 真相源——在线列表**实测不含 `[1M]` 变体**，变体只能手配；`default_version` 须为 `versions` 之一；`versions_include` 正则过滤在线发现（缺省 `.*`）
+- `permission_mode`（可选，顶层；详 §14）：ccx **交互启动**的默认权限模式，命令行显式 `--permission-mode` 单次优先；**缺键 = A期行为**（不追加）
 
 **state.json**（schema 1）：
 ```json
@@ -193,7 +195,7 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 
 | 命令 | 行为 |
 |---|---|
-| `ccx` | 交互选模型（多组时）→ **交互选版本**（§13：组配了 versions 或在线有发现；唯一选项静默直用；回车=默认版）→ **自动选号** → 启动 claude（参数全透传） |
+| `ccx` | 交互选模型（多组时）→ **交互选版本**（§13：组配了 versions 或在线有发现；唯一选项静默直用；回车=默认版）→ **自动选号** → 启动 claude（参数全透传；带值参数的值不当别名，配了 `permission_mode` 则追加默认权限模式——§14） |
 | `ccx -c` / `ccx -r` | 续会话，重新走自动选号（多组时同样先选组；版本菜单同 §13，回车=默认） |
 | `ccx <model>` | 按模型别名直启（如 `ccx glm` → bigmodel 组；版本=`default_version` 直用不问，组未配则账号 env 原样） |
 | `ccx <model>@<id>` | 手动指定号（强指） |
@@ -202,6 +204,7 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 | `ccx unlock <id>` | 解锁 blocked |
 | `ccx add` / `ccx rm <id>` | 号池维护（向导式，token 只写 registry） |
 | `ccx set-default <id>` | registry + settings.json 快照同步（**唯一**写 settings.json 的入口） |
+| `ccx set-permission-mode <mode\|off>` | 本机交互启动的默认权限模式：写 / 删 registry `permission_mode`（命令行 `--permission-mode` 单次优先；§14） |
 | `ccx import-ccswitch`（可选任务） | 一次性从 `~/.cc-switch/cc-switch.db` 导入存量号 |
 | `ccx check` | 全池逐号预检（= §6 preflight 的手动全量版），面板显示每号实测结果 |
 | `/modelx`（会话内） | 池面板 + 当前窗口号 + **会话内一键标记**：直接执行插件目录 `ccx.ps1 mark <id> <type>`（评审#2 裁定——死窗口里没有 PowerShell，指引式两步太脆；CLI `ccx mark` 保留为兜底），标记完提示 `ccx -c` 续跑即自动换号 |
@@ -214,6 +217,8 @@ P5 定谳后仍维持"写完整合并 env 块"（§8）：临时文件自洽、�
 - **写完整 env 块而非仅差异键**：合并语义已由 P5 定谳为**按键合并**，但维持写完整块——临时文件自洽、对未来语义变化免疫，`CLAUDE_CODE_EFFORT_LEVEL` / `ENABLE_TOOL_SEARCH` 等绝不丢（铁律：不破坏既有行为）；`--settings` 文件路径可用性已由 P4 实证
 - **CCX_ACCOUNT_ID / CCX_ACCOUNT_LABEL 走进程 env**（settings.json 未定义这些键，P1 已证此路畅通）→ SessionStart hook 与 statusline 由此读当前号
 - **PowerShell 5.1 兼容**：无 `&&`/三元；JSON 一律走临时文件，不做内联传参（引号地狱）
+- **切参（§14）**：必带值参数（`claude --help` 里 `<…>` 形式，如 `--permission-mode` / `--model` / `--add-dir`）后 1 个 token 归该参数、不当模型别名；可选值参数（`-r` / `-c` / `-p`…）与布尔参数维持「首个非 - 开头 = 别名」
+- **默认权限模式（§14）**：透传里没有 `-p` / `--print`、命令行没带 `--permission-mode` / `--dangerously-skip-permissions`、registry `permission_mode` 非空 → 启动前追加 `--permission-mode <值>`，并入启动行打印
 
 ---
 
@@ -240,6 +245,7 @@ ccx/
 ccx 启动(--settings 层) > 裸 claude(settings.json 快照号, 行为=今天) 
 ccx 崩 / registry 损坏 / 池空 → 显式报错 + 明示"裸 claude 仍可用"，不吞不装死
 settings.json 仅 set-default 显式改；值永远来自 registry（单一事实源）
+命令行 --permission-mode / --dangerously-skip-permissions > registry.permission_mode（仅交互启动） > 不追加（=A期原样）   ← §14
 ```
 
 **回归义务**：每次改动后必须验证一次裸 `claude` 场景（判据 §12-1），证明兜底层活着。
@@ -291,3 +297,67 @@ B 发现：GET 首号 base_url + /v1/models（Bearer·4s 超时·失败静默只
 - 组 glm：versions=[glm5.4[1M](默认), glm-5.3[1M]]，在线拉到 [glm-5.4, glm-5.3, glm-5.2, glm-4.5] → 菜单 4 项 = glm5.4[1M]←默认 / glm-5.3[1M] / ✚glm-5.2 / ✚glm-4.5（glm-5.4、glm-5.3 同基去重不追加）✓
 - 交互选 2 → 临时 settings `ANTHROPIC_MODEL=glm-5.3[1M]`、`*_MODEL_NAME=glm-5.3`，`ANTHROPIC_BASE_URL/AUTH_TOKEN` 原值 ✓
 - `ccx glm` 不问 → `ANTHROPIC_MODEL=glm5.4[1M]` ✓；组无 versions 且在线失败 → 无二级菜单照旧启动 ✓；在线失败但 C 有配置 → 菜单只显 C 无报错 ✓
+
+---
+
+## 14. 权限模式（带值参数不再吞别名 + 本机默认 bypassPermissions）
+
+> 2026-11-26 增量，**待用户确认**。用户原话："打开大模型页面需要选择跳过危险选项 `--permission-mode bypassPermissions`"。
+
+**现状（2026-11-26 本机 P8–P9 实证）**
+
+| # | 实验 | 结果 | 结论 |
+|---|---|---|---|
+| P8 | 切参模拟（不启动）：`ccx --permission-mode bypassPermissions` | `modelSpec='bypassPermissions'` → `未知模型: bypassPermissions` | **带值参数的值被当成模型别名**——"首个非 - 开头 = 别名"规则的缺口，§7「参数全透传」没兑现（`ccx --model x`、`ccx --name x` 同病） |
+| P8′ | `ccx glm --permission-mode bypassPermissions` | 别名 `glm`，透传 `[--permission-mode bypassPermissions]` | 别名在前就没事（**现成绕法**） |
+| P9 | Claude Code 2.1.332 二进制取证 | 免责弹窗（`WARNING: Claude Code running in Bypass Permissions mode` → `Yes, I accept`）只在「交互 + bypassPermissions + 未接受」出现；已接受 = userSettings `skipDangerousModePermissionPrompt`（本机 settings.json 已为 true） | ccx 带上 `--permission-mode bypassPermissions` **不会再弹**（`--settings` 临时文件只含 env，user settings 照常加载） |
+
+ccx 今天启动 = `claude --settings <临时文件> <透传>`，从不带权限模式 → 会话进来是 default；平时的习惯启动是 `claude --permission-mode bypassPermissions`（本会话进程命令行实证）。
+
+**目标 / 非目标 / 反目标**
+
+| | 内容 |
+|---|---|
+| 目标 1 | 带值参数的值不再被当成模型别名（修 bug） |
+| 目标 2 | 本机一次性配置后，裸 `ccx` / `ccx -c` / `ccx -r` 打开的会话默认就是 `bypassPermissions`；单次启动命令行 `--permission-mode <其他>` 优先 |
+| 非目标 | ① 不动 `~/.claude/settings.json`（含 `permissions.defaultMode`：会连 `claude -p` 自动化一起变，且 cc-switch 会重写该文件）② 不在代码里写死默认（公开插件，别人装了不该默认 bypass）③ `-p/--print` 非交互路径不变（本机仓内与 profile 无 `ccx -p` 脚本，grep 实证）④ 可选值参数（`-r` / `-c` / `-p` / `--debug` / `--worktree`…）维持 A期规则 |
+| 反目标 | registry 没配时 ccx 传给 claude 的参数与 A期有一个字节不同；同一次启动出现两个 `--permission-mode` |
+
+**机制**
+
+```
+ccx <args>
+  │
+  ▼ ① 切参
+  参数在「必带值参数表」里 ──是──► 其后 1 个 token 归该参数（透传，不当别名）
+     │否
+  其余照 A期：首个非 - 开头 token = 模型别名；--no-check 剥离
+  │
+  ▼ ② 权限模式合成（仅交互启动 = 透传里没有 -p / --print）
+  命令行已有 --permission-mode / --dangerously-skip-permissions ──是──► 原样（显式优先）
+     │否
+  registry.permission_mode 非空 ──是──► 追加 --permission-mode <值>（并入启动行）
+     │否
+    不追加（= A期原样，兜底）
+  │
+  ▼
+claude --settings <临时文件> <透传> [--permission-mode X]
+```
+
+- **必带值参数表** = `claude --help` 里 `<…>` 形式的参数（2.1.332 共 31 个）：`--permission-mode` `--model` `--agents` `--agent` `--add-dir` `--allowedTools` `--allowed-tools` `--disallowedTools` `--disallowed-tools` `--append-system-prompt` `--system-prompt` `--effort` `--fallback-model` `-n` / `--name` `--session-id` `--settings` `--setting-sources` `--mcp-config` `--plugin-dir` `--plugin-url` `--json-schema` `--debug-file` `--output-format` `--input-format` `--permission-prompts` `--autocompact` `--betas` `--environment` `--file` `--max-budget-usd` `--tools` `--remote-control-session-name-prefix` `--system-prompt-snapshot`
+  - claude 日后新增、没进表的带值参数 → 回落 A期规则（明错「未知模型」，不静默）
+  - 新规则在表内位置上**只会把报错变成可用**：旧规则下值被当别名 → `未知模型`，或别名被抠走 → claude 报参数缺值；所以无「原来有 → 现在无」
+- **为什么可选值参数不改**：`ccx -r glm` 今天 = 「选 glm 再列会话」，改成「续会话 glm」反而破坏；续指定会话仍用别名在前 `ccx glm -r <id>`
+- **registry**：顶层可选键 `permission_mode`（§4），取值 ∈ {`default` `acceptEdits` `auto` `bypassPermissions` `manual` `dontAsk` `plan`}（claude 实测：`default` 可用；别的名字启动即报 `invalid. Allowed choices are …`）
+- **`ccx set-permission-mode <mode|off>`**：写 / 删该键（`Save-CcxJson` 原子写；非法值明错退 1 不写）；`ccx list` 首行显示 `默认权限模式: <值>`（没配不显示）
+- **代价与边界**：开了 = ccx 启动的交互会话在哪个目录都不再逐条询问（与手敲 `claude --permission-mode bypassPermissions` 等价）；裸 `claude` 不受影响
+
+**验收（数值代入；假 claude 记参，零真实启动）**
+1. 单组 registry：`ccx --permission-mode bypassPermissions` → 不报「未知模型」、直接启动；假 claude 收到 `--settings <tmp> --permission-mode bypassPermissions` ✓
+2. `ccx --permission-mode plan glm` → 别名 `glm`、透传 `--permission-mode plan` ✓
+3. 回归（registry 无 `permission_mode`）：`ccx glm` → 假 claude 参数与 A期逐字节一致（无 `--permission-mode`）✓；`ccx -r glm` → 仍是别名 `glm` + 透传 `-r` ✓
+4. registry `permission_mode=bypassPermissions`：`ccx glm` → `--settings <tmp> --permission-mode bypassPermissions`，启动行含 `--permission-mode bypassPermissions` ✓；`ccx -c` 同 ✓
+5. 显式优先：同上，`ccx glm --permission-mode plan` → 恰好一个 `--permission-mode` 且值为 `plan` ✓；`ccx glm --dangerously-skip-permissions` → 不追加 ✓
+6. `-p` 不变：同上，`ccx glm -p hi` → 不含 `--permission-mode` ✓
+7. `ccx set-permission-mode bypassPermissions` → 键写入；`ccx set-permission-mode off` → 键删除；`ccx set-permission-mode foo` → 退出 1、registry 未改 ✓
+8. 实机冒烟（人工一次）：`ccx set-permission-mode bypassPermissions` → `ccx` → 选组 / 选版本 → 状态行 = bypass permissions on、无免责弹窗 ✓；裸 `claude` 启动行为不变（§12-1）✓
